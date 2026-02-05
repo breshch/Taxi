@@ -1,0 +1,487 @@
+import streamlit as st
+import sqlite3
+from datetime import datetime
+
+# ===== НАСТРОЙКИ =====
+DB_NAME = "taxi.db"
+rate_nal = 0.78        # процент для нала (для расчёта комиссии)
+rate_card = 0.75       # процент для карты
+FUEL_PRICE = 55.0      # цена бензина за литр
+FUEL_CONSUMPTION = 8.0 # расход л/100 км
+
+
+# ===== КАСТОМНЫЙ ДИЗАЙН / CSS =====
+def apply_custom_css():
+    st.markdown(
+        """
+        <style>
+        .stApp {
+            background: #f3f4f6;
+            color: #111827;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+        }
+        .block-container {
+            padding-top: 0.8rem;
+            padding-bottom: 0.8rem;
+            max-width: 720px;
+        }
+        h1 {
+            font-size: 1.6rem !important;
+            text-align: center;
+            margin-bottom: 0.5rem;
+            color: #0f172a;
+        }
+        h2, h3 {
+            color: #1f2933;
+            font-size: 1.1rem !important;
+            margin-top: 0.8rem;
+            margin-bottom: 0.4rem;
+        }
+        .streamlit-expanderHeader {
+            font-weight: 600;
+            font-size: 0.95rem;
+        }
+        .stExpander {
+            background: #ffffff !important;
+            border-radius: 0.75rem !important;
+            border: 1px solid #e5e7eb !important;
+            padding: 0.2rem 0.4rem !important;
+        }
+        .stMetric {
+            background-color: #ffffff;
+            padding: 0.4rem 0.6rem;
+            border-radius: 0.75rem;
+            border: 1px solid #e5e7eb;
+        }
+        button[kind="primary"], button[kind="secondary"] {
+            border-radius: 999px !important;
+            padding-top: 0.5rem !important;
+            padding-bottom: 0.5rem !important;
+            font-weight: 600 !important;
+            background-color: #bfdbfe !important;
+            color: #111827 !important;
+            border: 1px solid #93c5fd !important;
+        }
+        button[kind="primary"]:hover, button[kind="secondary"]:hover {
+            background-color: #93c5fd !important;
+            color: #111827 !important;
+        }
+        hr {
+            margin: 0.3rem 0 !important;
+            border-color: #e5e7eb;
+        }
+        .stForm, .stMarkdown, .stNumberInput, .stSelectbox, .stFileUploader {
+            margin-bottom: 0.4rem !important;
+        }
+        .stContainer {
+            background-color: transparent;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ===== ФУНКЦИИ БД =====
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS shifts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            km INTEGER DEFAULT 0,
+            fuel_liters REAL DEFAULT 0,
+            fuel_price REAL DEFAULT 0,
+            is_open INTEGER DEFAULT 1,
+            opened_at TEXT,
+            closed_at TEXT
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            shift_id INTEGER,
+            type TEXT NOT NULL,
+            amount REAL NOT NULL,
+            tips REAL DEFAULT 0,
+            commission REAL NOT NULL,
+            total REAL NOT NULL,
+            beznal_added REAL DEFAULT 0,
+            order_time TEXT
+        )
+        """
+    )
+    # на случай старой таблицы без order_time
+    try:
+        cursor.execute("ALTER TABLE orders ADD COLUMN order_time TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS accumulated_beznal (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            driver_id INTEGER DEFAULT 1,
+            total_amount REAL DEFAULT 0,
+            last_updated TEXT
+        )
+        """
+    )
+
+    cursor.execute("SELECT id FROM accumulated_beznal WHERE driver_id = 1")
+    if not cursor.fetchone():
+        cursor.execute(
+            "INSERT INTO accumulated_beznal "
+            "(driver_id, total_amount, last_updated) "
+            "VALUES (1, 0, ?)",
+            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),),
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def get_open_shift():
+    """Возвращает (id, date) открытой смены или None."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, date FROM shifts WHERE is_open = 1 LIMIT 1")
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
+
+def open_shift(date_str: str) -> int:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute(
+        "INSERT INTO shifts (date, is_open, opened_at) VALUES (?, 1, ?)",
+        (date_str, now),
+    )
+    shift_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return shift_id
+
+
+def close_shift_db(shift_id: int, km: int, liters: float, fuel_price: float):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute(
+        """
+        UPDATE shifts
+        SET is_open = 0, km = ?, fuel_liters = ?, fuel_price = ?, closed_at = ?
+        WHERE id = ?
+        """,
+        (km, liters, fuel_price, now, shift_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def add_order_db(
+    shift_id,
+    order_type,
+    amount,
+    tips,
+    commission,
+    total,
+    beznal_added,
+    order_time,
+):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO orders (shift_id, type, amount, tips, commission, total, beznal_added, order_time)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            shift_id,
+            order_type,
+            amount,
+            tips,
+            commission,
+            total,
+            beznal_added,
+            order_time,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_shift_orders(shift_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT type, amount, tips, commission, total, beznal_added, order_time
+        FROM orders
+        WHERE shift_id = ?
+        ORDER BY id
+        """,
+        (shift_id,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+
+def get_shift_totals(shift_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT type, SUM(total - tips) FROM orders "
+        "WHERE shift_id = ? GROUP BY type",
+        (shift_id,),
+    )
+    by_type = dict(cursor.fetchall())
+
+    cursor.execute(
+        "SELECT SUM(tips), SUM(beznal_added) FROM orders WHERE shift_id = ?",
+        (shift_id,),
+    )
+    tips_sum, beznal_sum = cursor.fetchone()
+    tips_sum = tips_sum or 0
+    beznal_sum = beznal_sum or 0
+
+    conn.close()
+    by_type["чаевые"] = tips_sum
+    by_type["безнал_смена"] = beznal_sum
+    return by_type
+
+
+def get_accumulated_beznal():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT total_amount FROM accumulated_beznal WHERE driver_id = 1")
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else 0.0
+
+
+def add_to_accumulated_beznal(amount: float):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute(
+        """
+        UPDATE accumulated_beznal
+        SET total_amount = total_amount + ?, last_updated = ?
+        WHERE driver_id = 1
+        """,
+        (amount, now),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_shift_template():
+    today = datetime.now().strftime("%Y-%m-%d")
+    return {
+        "date": today,
+        "planned_km": 200,
+        "planned_hours": 8,
+        "note": "",
+    }
+
+
+# ===== UI =====
+st.set_page_config(page_title="Такси учёт", page_icon="🚕", layout="centered")  # [web:811]
+apply_custom_css()
+init_db()
+
+st.title("🚕 Учёт работы такси")
+
+open_shift_data = get_open_shift()
+
+if not open_shift_data:
+    st.info("Сейчас нет открытой смены.")
+
+    with st.expander("📝 Шаблон новой смены", expanded=True):
+        tpl = get_shift_template()
+
+        with st.form("new_shift_template"):
+            date_input = st.date_input(
+                "Дата смены",
+                value=datetime.strptime(tpl["date"], "%Y-%m-%d"),
+            )
+            col1, col2 = st.columns(2)
+            with col1:
+                planned_km = st.number_input(
+                    "Планируемый пробег, км",
+                    min_value=0,
+                    step=10,
+                    value=int(tpl["planned_km"]),
+                )
+            with col2:
+                planned_hours = st.number_input(
+                    "Планируемые часы",
+                    min_value=0,
+                    step=1,
+                    value=int(tpl["planned_hours"]),
+                )
+
+            note = st.text_input("Заметка к смене", value=tpl["note"])
+
+            submitted_tpl = st.form_submit_button(
+                "📂 Открыть смену по шаблону",
+            )
+
+        if submitted_tpl:
+            open_shift(date_input.strftime("%Y-%m-%d"))
+            st.success("Смена открыта по шаблону.")
+            st.rerun()  # [web:681]
+
+    st.caption("История и отчёты — на страницах Reports / Admin в левом меню.")
+else:
+    shift_id, date = open_shift_data
+    st.success(f"📅 Открыта смена: {date}")
+
+    acc = get_accumulated_beznal()
+    if acc != 0:
+        st.metric("Накопленный безнал", f"{acc:.0f} ₽")
+
+    # ===== Форма добавления заказа =====
+    with st.expander("➕ Добавить заказ", expanded=True):
+        with st.form("order_form"):
+            c1, c2 = st.columns(2)
+            with c1:
+                amount = st.number_input(
+                    "Сумма заказа, ₽", min_value=0.0, step=50.0, format="%.2f"
+                )
+            with c2:
+                payment = st.selectbox("Тип оплаты", ["нал", "карта"])
+
+            tips = st.number_input(
+                "Чаевые, ₽ (без комиссии)", min_value=0.0, step=10.0, value=0.0
+            )
+
+            st.caption(f"Текущее время: {datetime.now().strftime('%H:%M')}")
+
+            submitted = st.form_submit_button("💾 Сохранить заказ")
+
+        if submitted and amount > 0:
+            order_time = datetime.now().strftime("%H:%M")
+
+            if payment == "нал":
+                typ = "нал"
+                final_wo_tips = amount
+                commission = amount * (1 - rate_nal)
+                total = amount + tips
+                beznal_added = -commission
+            else:
+                typ = "карта"
+                final_wo_tips = amount * rate_card
+                commission = amount - final_wo_tips
+                total = final_wo_tips + tips
+                beznal_added = final_wo_tips
+
+            add_order_db(
+                shift_id, typ, amount, tips, commission, total, beznal_added, order_time
+            )
+            if beznal_added != 0:
+                add_to_accumulated_beznal(beznal_added)
+
+            st.success(f"✓ Сохранено. Вам сразу: {total:.2f} ₽")
+            st.rerun()
+
+    # ===== Список заказов и итоги =====
+    orders = get_shift_orders(shift_id)
+    totals = get_shift_totals(shift_id) if orders else {}
+    nal = totals.get("нал", 0.0)
+    card = totals.get("карта", 0.0)
+    tips_sum = totals.get("чаевые", 0.0)
+    beznal_this = totals.get("безнал_смена", 0.0)
+
+    if orders:
+        st.subheader("📋 Заказы за смену")
+
+        for i, (typ, amount, tips, comm, total, beznal_add, order_time) in enumerate(
+            orders, 1
+        ):
+            with st.container():
+                left, right = st.columns([2, 1])
+
+                with left:
+                    time_str = f"{order_time} · " if order_time else ""
+                    st.markdown(
+                        f"**#{i}** · {time_str}"
+                        f"{'💵 Нал' if typ == 'нал' else '💳 Карта'} · "
+                        f"{amount:.0f} ₽"
+                    )
+                    details = []
+                    if tips > 0:
+                        details.append(f"чаевые {tips:.0f} ₽")
+                    if beznal_add > 0:
+                        details.append(f"+{beznal_add:.0f} ₽ в безнал")
+                    elif beznal_add < 0:
+                        details.append(f"{beznal_add:.0f} ₽ списано с безнала")
+                    if details:
+                        st.caption(", ".join(details))
+
+                with right:
+                    st.markdown(f"**Вам:** {total:.0f} ₽")
+
+                st.divider()
+
+        st.subheader("💼 Итоги по смене")
+
+        top = st.container()
+        bottom = st.container()
+
+        with top:
+            c1, c2 = st.columns(2)
+            c1.metric("Нал", f"{nal:.0f} ₽")
+            c2.metric("Карта", f"{card:.0f} ₽")
+
+        with bottom:
+            c3, c4 = st.columns(2)
+            c3.metric("Чаевые", f"{tips_sum:.0f} ₽")
+            c4.metric("Изм. безнала", f"{beznal_this:.0f} ₽")
+
+        total_day = nal + card + tips_sum
+        st.caption(f"Всего за смену (до бензина): {total_day:.0f} ₽")
+
+    # ===== Закрытие смены =====
+    st.write("---")
+    with st.expander("🔒 Закрыть смену (километраж)"):
+        with st.form("close_form"):
+            km = st.number_input(
+                "Километраж за смену (км)", min_value=0, step=10
+            )
+
+            if km > 0:
+                liters = (km / 100) * FUEL_CONSUMPTION
+                fuel_cost = liters * FUEL_PRICE
+                st.write(
+                    f"Расход: {liters:.1f} л, бензин: {fuel_cost:.2f} ₽"
+                )
+            else:
+                fuel_cost = 0.0
+
+            submitted_close = st.form_submit_button("🔒 Закрыть смену")
+            if submitted_close:
+                liters = (km / 100) * FUEL_CONSUMPTION
+                fuel_cost = liters * FUEL_PRICE
+                close_shift_db(shift_id, km, liters, FUEL_PRICE)
+
+                income = nal + card + tips_sum
+                profit = income - fuel_cost
+
+                st.success("Смена закрыта.")
+                r1, r2, r3 = st.columns(3)
+                r1.metric("Доход", f"{income:.0f} ₽")
+                r2.metric("Бензин", f"{fuel_cost:.0f} ₽")
+                r3.metric("Чистая прибыль", f"{profit:.0f} ₽")
+                st.rerun()  # [web:681] 

@@ -67,18 +67,33 @@ def get_available_year_months():
 def get_current_accumulated_beznal() -> float:
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute(
-        "SELECT total_amount FROM accumulated_beznal WHERE driver_id = 1"
-    )
-    row = cur.fetchone()
+    try:
+        cur.execute(
+            "SELECT total_amount FROM accumulated_beznal WHERE driver_id = 1"
+        )
+        row = cur.fetchone()
+    except Exception:
+        row = None
     conn.close()
     return float(row[0]) if row and row[0] is not None else 0.0
 
 
-def get_month_totals(year_month: str):
+def get_month_totals(year_month: str | None):
     """
     Итоги за месяц по ЗАКРЫТЫМ сменам, где есть хотя бы один заказ.
+    Если year_month is None или нет смен — всё по нулям.
     """
+    if not year_month:
+        return {
+            "нал": 0.0,
+            "карта": 0.0,
+            "чаевые": 0.0,
+            "безнал_добавлено": 0.0,
+            "всего": 0.0,
+            "смен": 0,
+            "накопленный_безнал": get_current_accumulated_beznal(),
+        }
+
     conn = get_connection()
     cur = conn.cursor()
 
@@ -136,11 +151,26 @@ def get_month_totals(year_month: str):
     }
 
 
-def get_month_shifts_details(year_month: str) -> pd.DataFrame:
+def get_month_shifts_details(year_month: str | None) -> pd.DataFrame:
     """
     Одна строка на каждую ЗАКРЫТУЮ смену, у которой есть хотя бы один заказ.
-    Км/литры/цена берутся только из закрытия смены.
+    Если месяца нет или нет смен — пустой DataFrame.
     """
+    if not year_month:
+        return pd.DataFrame(
+            columns=[
+                "Дата",
+                "Нал",
+                "Карта",
+                "Чаевые",
+                "Δ безнал",
+                "Км",
+                "Литры",
+                "Цена",
+                "Всего",
+            ]
+        )
+
     conn = get_connection()
     cur = conn.cursor()
 
@@ -203,6 +233,8 @@ def get_month_shifts_details(year_month: str) -> pd.DataFrame:
 
 def get_closed_shift_id_by_date(date_str: str):
     """id ЗАКРЫТОЙ смены по дате."""
+    if not date_str:
+        return None
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -219,7 +251,9 @@ def get_shift_orders_df(shift_id: int | None) -> pd.DataFrame:
     Заказы в смене: одна строка = один заказ.
     """
     if shift_id is None:
-        return pd.DataFrame()
+        return pd.DataFrame(
+            columns=["Время", "Тип", "Сумма", "Чаевые", "Δ безнал", "Вам"]
+        )
 
     conn = get_connection()
     cur = conn.cursor()
@@ -261,10 +295,13 @@ def get_shift_orders_df(shift_id: int | None) -> pd.DataFrame:
     return df
 
 
-def get_orders_by_hour(date_str: str) -> pd.DataFrame:
+def get_orders_by_hour(date_str: str | None) -> pd.DataFrame:
     """
     Кол-во заказов по часам за дату.
     """
+    if not date_str:
+        return pd.DataFrame({"Час": list(range(24)), "Заказов": [0] * 24})
+
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -328,7 +365,7 @@ month_name = {
 
 
 def format_month_option(s) -> str:
-    if s is None:
+    if s is None or s == "":
         return "—"
     s_str = str(s)
     if len(s_str) >= 7:
@@ -343,31 +380,29 @@ def format_month_option(s) -> str:
 st.set_page_config(page_title="Отчёты", page_icon="📊", layout="centered")
 st.title("📊 Отчёты")
 
-# Проверка, пустая ли база
-if is_db_empty():
-    st.info(
-        "База данных пока пуста: нет ни смен, ни заказов.\n\n"
-        "Создайте хотя бы одну смену и один заказ, после этого здесь появятся отчёты."
-    )
-    st.stop()
-
+db_empty = is_db_empty()
 year_months = get_available_year_months()
 
-if not year_months:
+if db_empty:
     st.info(
-        "В базе есть данные, но пока нет закрытых смен с заказами.\n\n"
-        "Закройте хотя бы одну смену с заказами, и здесь появятся отчёты за месяц."
+        "База данных пока пуста: нет ни смен, ни заказов.\n\n"
+        "Отчёты ниже будут пустыми, пока вы не добавите данные."
     )
-    st.stop()
+
+if not year_months:
+    # добавляем фиктивный вариант, чтобы selectbox всё равно работал
+    month_options = [""]  # пустой месяц
+else:
+    month_options = year_months
 
 ym = st.selectbox(
     "Выберите месяц",
-    year_months,
+    month_options,
     format_func=format_month_option,
 )
 
-df_shifts = get_month_shifts_details(ym)
-totals = get_month_totals(ym)
+df_shifts = get_month_shifts_details(ym if ym else None)
+totals = get_month_totals(ym if ym else None)
 
 st.write("---")
 
@@ -376,6 +411,7 @@ st.subheader("📄 Отчёт по смене")
 
 if df_shifts.empty:
     st.write("Нет закрытых смен с заказами за выбранный месяц.")
+    selected_date = None
 else:
     available_dates = df_shifts["Дата"].unique().tolist()
     selected_date = st.selectbox(
@@ -403,9 +439,9 @@ else:
         width="stretch",
     )
 
-    shift_id = get_closed_shift_id_by_date(selected_date)
     st.markdown("**Заказы в смене**")
 
+    shift_id = get_closed_shift_id_by_date(selected_date)
     df_orders = get_shift_orders_df(shift_id)
     if df_orders.empty:
         st.write("Нет заказов для выбранной смены.")
@@ -422,15 +458,14 @@ else:
             width="stretch",
         )
 
-    st.markdown("**График заказов по часам**")
-    df_hours = get_orders_by_hour(selected_date)
-    df_hours["Час"] = df_hours["Час"].apply(lambda h: f"{h:02d}:00")
-
-    st.bar_chart(
-        data=df_hours,
-        x="Час",
-        y="Заказов",
-    )
+st.markdown("**График заказов по часам**")
+df_hours = get_orders_by_hour(selected_date if selected_date else None)
+df_hours["Час"] = df_hours["Час"].apply(lambda h: f"{h:02d}:00")
+st.bar_chart(
+    data=df_hours,
+    x="Час",
+    y="Заказов",
+)
 
 # 2. ОТЧЁТ ПО СМЕНАМ ЗА МЕСЯЦ
 st.write("---")
@@ -459,27 +494,25 @@ else:
 st.write("---")
 st.subheader("📊 Отчёт за месяц")
 
-if df_shifts.empty:
-    st.write("Итоги за месяц недоступны, так как нет закрытых смен с заказами.")
-else:
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Нал", f"{totals['нал']:.0f} ₽")
-    col2.metric("Карта", f"{totals['карта']:.0f} ₽")
-    col3.metric("Чаевые", f"{totals['чаевые']:.0f} ₽")
+col1, col2, col3 = st.columns(3)
+col1.metric("Нал", f"{totals['нал']:.0f} ₽")
+col2.metric("Карта", f"{totals['карта']:.0f} ₽")
+col3.metric("Чаевые", f"{totals['чаевые']:.0f} ₽")
 
-    col4, col5, col6 = st.columns(3)
-    col4.metric("Изм. безнала (за месяц)", f"{totals['безнал_добавлено']:.0f} ₽")
-    col5.metric("Накопленный безнал (текущий)", f"{totals['накопленный_безнал']:.0f} ₽")
-    col6.metric("Смен", f"{totals['смен']}")
+col4, col5, col6 = st.columns(3)
+col4.metric("Изм. безнала (за месяц)", f"{totals['безнал_добавлено']:.0f} ₽")
+col5.metric("Накопленный безнал (текущий)", f"{totals['накопленный_безнал']:.0f} ₽")
+col6.metric("Смен", f"{totals['смен']}")
 
-    total_income = totals["всего"]
-    fuel_cost = float((df_shifts["Литры"].fillna(0) * df_shifts["Цена"].fillna(0)).sum())
-    profit = total_income - fuel_cost
+total_income = totals["всего"]
+# даже при пустом df_shifts это безопасно: будет 0
+fuel_cost = float((df_shifts["Литры"].fillna(0) * df_shifts["Цена"].fillna(0)).sum()) if not df_shifts.empty else 0.0
+profit = total_income - fuel_cost
 
-    st.write("---")
-    st.subheader("💰 Финансовый результат за месяц")
+st.write("---")
+st.subheader("💰 Финансовый результат за месяц")
 
-    col7, col8, col9 = st.columns(3)
-    col7.metric("Доход (всего)", f"{total_income:.0f} ₽")
-    col8.metric("Бензин (расход)", f"{fuel_cost:.0f} ₽")
-    col9.metric("Прибыль (≈)", f"{profit:.0f} ₽")
+col7, col8, col9 = st.columns(3)
+col7.metric("Доход (всего)", f"{total_income:.0f} ₽")
+col8.metric("Бензин (расход)", f"{fuel_cost:.0f} ₽")
+col9.metric("Прибыль (≈)", f"{profit:.0f} ₽")

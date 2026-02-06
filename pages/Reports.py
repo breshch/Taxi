@@ -11,11 +11,72 @@ def get_connection():
     return sqlite3.connect(DB_NAME)
 
 
+def init_db():
+    """Создаём таблицы, если их ещё нет (совместимо с Admin.py)."""
+    conn = get_connection()
+    cur = conn.cursor()
+
+    # shifts
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS shifts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            km INTEGER DEFAULT 0,
+            fuel_liters REAL DEFAULT 0,
+            fuel_price REAL DEFAULT 0,
+            is_open INTEGER DEFAULT 1,
+            opened_at TEXT,
+            closed_at TEXT
+        )
+        """
+    )
+
+    # orders
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            shift_id INTEGER,
+            type TEXT NOT NULL,
+            amount REAL NOT NULL,
+            tips REAL DEFAULT 0,
+            commission REAL NOT NULL,
+            total REAL NOT NULL,
+            beznal_added REAL DEFAULT 0,
+            order_time TEXT
+        )
+        """
+    )
+
+    # accumulated_beznal
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS accumulated_beznal (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            driver_id INTEGER DEFAULT 1,
+            total_amount REAL DEFAULT 0,
+            last_updated TEXT
+        )
+        """
+    )
+
+    # гарантия записи для driver_id = 1
+    cur.execute(
+        """
+        INSERT INTO accumulated_beznal (driver_id, total_amount, last_updated)
+        SELECT 1, 0, NULL
+        WHERE NOT EXISTS (
+            SELECT 1 FROM accumulated_beznal WHERE driver_id = 1
+        )
+        """
+    )
+
+    conn.commit()
+    conn.close()
+
+
 def is_db_empty() -> bool:
-    """
-    Проверка, что база фактически пустая:
-    нет ни одной записи ни в shifts, ни в orders.
-    """
     conn = get_connection()
     cur = conn.cursor()
     try:
@@ -37,6 +98,7 @@ def is_db_empty() -> bool:
 def get_available_year_months():
     """
     Месяцы только по закрытым сменам, у которых есть хотя бы один заказ.
+    (is_open = 0 и есть строки в orders).
     """
     conn = get_connection()
     cur = conn.cursor()
@@ -69,7 +131,8 @@ def get_current_accumulated_beznal() -> float:
     cur = conn.cursor()
     try:
         cur.execute(
-            "SELECT total_amount FROM accumulated_beznal WHERE driver_id = 1"
+            "SELECT total_amount FROM accumulated_beznal "
+            "WHERE driver_id = 1 ORDER BY id DESC LIMIT 1"
         )
         row = cur.fetchone()
     except Exception:
@@ -81,7 +144,11 @@ def get_current_accumulated_beznal() -> float:
 def get_month_totals(year_month: str | None):
     """
     Итоги за месяц по ЗАКРЫТЫМ сменам, где есть хотя бы один заказ.
-    Если year_month is None или нет смен — всё по нулям.
+    Берём:
+      - 'нал'  = SUM(total - tips) по type='нал'
+      - 'карта' = SUM(total - tips) по type='карта'
+      - чаевые = SUM(tips)
+      - безнал_добавлено = SUM(beznal_added)
     """
     if not year_month:
         return {
@@ -115,6 +182,7 @@ def get_month_totals(year_month: str | None):
     total_beznal_add = 0.0
 
     for (shift_id,) in shifts:
+        # разбор по типам оплаты
         cur.execute(
             "SELECT type, SUM(total - tips) "
             "FROM orders WHERE shift_id = ? GROUP BY type",
@@ -127,6 +195,7 @@ def get_month_totals(year_month: str | None):
             elif typ == "карта":
                 total_card += summ
 
+        # чаевые и изменение безнала
         cur.execute(
             "SELECT SUM(tips), SUM(beznal_added) "
             "FROM orders WHERE shift_id = ?",
@@ -154,7 +223,7 @@ def get_month_totals(year_month: str | None):
 def get_month_shifts_details(year_month: str | None) -> pd.DataFrame:
     """
     Одна строка на каждую ЗАКРЫТУЮ смену, у которой есть хотя бы один заказ.
-    Если месяца нет или нет смен — пустой DataFrame.
+    Км/литры/цена берутся из таблицы shifts.
     """
     if not year_month:
         return pd.DataFrame(
@@ -232,7 +301,6 @@ def get_month_shifts_details(year_month: str | None) -> pd.DataFrame:
 
 
 def get_closed_shift_id_by_date(date_str: str):
-    """id ЗАКРЫТОЙ смены по дате."""
     if not date_str:
         return None
     conn = get_connection()
@@ -247,9 +315,6 @@ def get_closed_shift_id_by_date(date_str: str):
 
 
 def get_shift_orders_df(shift_id: int | None) -> pd.DataFrame:
-    """
-    Заказы в смене: одна строка = один заказ.
-    """
     if shift_id is None:
         return pd.DataFrame(
             columns=["Время", "Тип", "Сумма", "Чаевые", "Δ безнал", "Вам"]
@@ -296,9 +361,6 @@ def get_shift_orders_df(shift_id: int | None) -> pd.DataFrame:
 
 
 def get_orders_by_hour(date_str: str | None) -> pd.DataFrame:
-    """
-    Кол-во заказов по часам за дату.
-    """
     if not date_str:
         return pd.DataFrame({"Час": list(range(24)), "Заказов": [0] * 24})
 
@@ -347,7 +409,7 @@ def get_orders_by_hour(date_str: str | None) -> pd.DataFrame:
     return df
 
 
-# ===== Справочники =====
+# ===== Справочник месяцев =====
 month_name = {
     1: "январь",
     2: "февраль",
@@ -380,18 +442,18 @@ def format_month_option(s) -> str:
 st.set_page_config(page_title="Отчёты", page_icon="📊", layout="centered")
 st.title("📊 Отчёты")
 
+init_db()
 db_empty = is_db_empty()
 year_months = get_available_year_months()
 
 if db_empty:
     st.info(
         "База данных пока пуста: нет ни смен, ни заказов.\n\n"
-        "Отчёты ниже будут пустыми, пока вы не добавите данные."
+        "Залейте данные через страницу Admin, затем вернитесь сюда."
     )
 
 if not year_months:
-    # добавляем фиктивный вариант, чтобы selectbox всё равно работал
-    month_options = [""]  # пустой месяц
+    month_options = [""]
 else:
     month_options = year_months
 
@@ -406,7 +468,7 @@ totals = get_month_totals(ym if ym else None)
 
 st.write("---")
 
-# 1. ОТЧЁТ ПО ОДНОЙ СМЕНЕ
+# 1. Отчёт по одной смене
 st.subheader("📄 Отчёт по смене")
 
 if df_shifts.empty:
@@ -467,7 +529,7 @@ st.bar_chart(
     y="Заказов",
 )
 
-# 2. ОТЧЁТ ПО СМЕНАМ ЗА МЕСЯЦ
+# 2. Отчёт по сменам за месяц (таблица)
 st.write("---")
 st.subheader("📅 Отчёт по сменам (таблица)")
 
@@ -490,7 +552,7 @@ else:
         width="stretch",
     )
 
-# 3. ОТЧЁТ ЗА МЕСЯЦ (ИТОГИ)
+# 3. Итоги за месяц
 st.write("---")
 st.subheader("📊 Отчёт за месяц")
 
@@ -505,8 +567,9 @@ col5.metric("Накопленный безнал (текущий)", f"{totals['�
 col6.metric("Смен", f"{totals['смен']}")
 
 total_income = totals["всего"]
-# даже при пустом df_shifts это безопасно: будет 0
-fuel_cost = float((df_shifts["Литры"].fillna(0) * df_shifts["Цена"].fillna(0)).sum()) if not df_shifts.empty else 0.0
+fuel_cost = float(
+    (df_shifts["Литры"].fillna(0) * df_shifts["Цена"].fillna(0)).sum()
+) if not df_shifts.empty else 0.0
 profit = total_income - fuel_cost
 
 st.write("---")

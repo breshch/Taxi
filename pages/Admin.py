@@ -1,685 +1,504 @@
 import streamlit as st
 import sqlite3
+from datetime import datetime
 import pandas as pd
+import os
 
 
 DB_NAME = "taxi.db"
+rate_nal = 0.78
+rate_card = 0.75
 
-# URL CSV первого листа Google Sheets
-CSV_URL = "https://docs.google.com/spreadsheets/d/1USdDnw5OnzcIgC0mBVWGKURDJox4ncc5SAUQn-euS3Q/export?format=csv&gid=588926391"
+# ===== ПРОСТАЯ АВТОРИЗАЦИЯ ДЛЯ АДМИНКИ =====
+
+ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "changeme")
 
 
-# ===== Работа с БД =====
+def check_admin_auth() -> bool:
+    """Простая проверка пароля, состояние держим в session_state."""
+    if "admin_authenticated" not in st.session_state:
+        st.session_state.admin_authenticated = False
+
+    if st.session_state.admin_authenticated:
+        return True
+
+    st.subheader("🔐 Вход в режим администрирования")
+
+    with st.form("admin_login"):
+        pwd = st.text_input("Пароль администратора", type="password")
+        ok = st.form_submit_button("Войти")
+
+    if ok:
+        if pwd == ADMIN_PASSWORD:
+            st.session_state.admin_authenticated = True
+            st.success("Доступ к администрированию открыт.")
+            return True
+        else:
+            st.error("Неверный пароль.")
+
+    return False
+
+
+# ===== БАЗА / ХЕЛПЕРЫ =====
+
 def get_connection():
     return sqlite3.connect(DB_NAME)
 
 
-def init_db():
-    """Создаём таблицы, если их ещё нет."""
+def safe_str_cell(v, default=""):
+    """Строка из ячейки: пустые/NaN -> default."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return default
+    s = str(v).strip()
+    return s if s != "" else default
+
+
+def safe_num_cell(v, default=0.0):
+    """Число из ячейки: пустые/NaN/мусор -> default."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return default
+    s = str(v).strip().replace(",", ".")
+    if s == "":
+        return default
+    try:
+        return float(s)
+    except ValueError:
+        return default
+
+
+def get_accumulated_beznal():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT total_amount FROM accumulated_beznal WHERE driver_id = 1")
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else 0.0
+
+
+def recalc_full_db():
     conn = get_connection()
     cur = conn.cursor()
 
+    cur.execute("SELECT id, type, amount, tips FROM orders")
+    rows = cur.fetchall()
+
+    for order_id, typ, amount, tips in rows:
+        amount_f = float(amount or 0)
+        tips_f = float(tips or 0)
+
+        if typ == "нал":
+            final_wo_tips = amount_f
+            commission = amount_f * (1 - rate_nal)
+            total = amount_f + tips_f
+            beznal_added = -commission
+        else:
+            final_wo_tips = amount_f * rate_card
+            commission = amount_f - final_wo_tips
+            total = final_wo_tips + tips_f
+            beznal_added = final_wo_tips
+
+        cur.execute(
+            """
+            UPDATE orders
+            SET commission = ?, total = ?, beznal_added = ?
+            WHERE id = ?
+            """,
+            (commission, total, beznal_added, order_id),
+        )
+
+    cur.execute("SELECT COALESCE(SUM(beznal_added), 0) FROM orders")
+    total_beznal = cur.fetchone()[0] or 0.0
+
+    cur.execute("SELECT id FROM accumulated_beznal WHERE driver_id = 1")
+    row = cur.fetchone()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    if row:
+        cur.execute(
+            """
+            UPDATE accumulated_beznal
+            SET total_amount = ?, last_updated = ?
+            WHERE driver_id = 1
+            """,
+            (total_beznal, now),
+        )
+    else:
+        cur.execute(
+            """
+            INSERT INTO accumulated_beznal (driver_id, total_amount, last_updated)
+            VALUES (1, ?, ?)
+            """,
+            (total_beznal, now),
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def import_from_excel(uploaded_file) -> int:
+    """
+    Импорт из Excel/CSV.
+
+    Строка без суммы или без даты не создаёт смену.
+    """
+    try:
+        if uploaded_file.name.lower().endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
+
+        df.columns = [str(c).strip() for c in df.columns]
+        st.write("📋 Найдены колонки:", df.columns.tolist())
+
+        if "Сумма" not in df.columns:
+            st.error("❌ В файле нет колонки 'Сумма'.")
+            return 0
+
+        df["Сумма"] = df["Сумма"].replace(r"^\s*$", pd.NA, regex=True)
+        df_clean = df[df["Сумма"].notna()].copy()
+
+        st.write(f"📊 Найдено строк с данными (Сумма не пустая): {len(df_clean)}")
+        st.write("Первые 5 строк:", df_clean.head())
+
+        if len(df_clean) == 0:
+            st.error("❌ В файле нет строк с суммой!")
+            return 0
+
+        imported = 0
+        errors = 0
+        conn = get_connection()
+        cur = conn.cursor()
+
+        for idx, row in df_clean.iterrows():
+            try:
+                raw_amount = row.get("Сумма")
+                amount_f = safe_num_cell(raw_amount, default=None)
+                if amount_f is None:
+                    st.warning(
+                        f"❌ Строка {idx}: пустая или некорректная сумма ({raw_amount!r}), пропускаю."
+                    )
+                    errors += 1
+                    continue
+
+                raw_date = row.get("Дата")
+                date_str = safe_str_cell(raw_date)
+                if not date_str:
+                    st.warning(
+                        f"❌ Строка {idx}: пустая дата при сумме {amount_f}, пропускаю."
+                    )
+                    errors += 1
+                    continue
+
+                cur.execute("SELECT id FROM shifts WHERE date = ?", (date_str,))
+                s = cur.fetchone()
+                if s:
+                    shift_id = s[0]
+                else:
+                    cur.execute(
+                        "INSERT INTO shifts (date, is_open, opened_at, closed_at) "
+                        "VALUES (?, 0, ?, ?)",
+                        (date_str, date_str, date_str),
+                    )
+                    shift_id = cur.lastrowid
+
+                raw_type = row.get("Тип", "нал")
+                raw_type_str = safe_str_cell(raw_type, default="нал").lower()
+                if raw_type_str in ("безнал", "card", "карта"):
+                    typ = "карта"
+                else:
+                    typ = "нал"
+
+                raw_tips = row.get("Чаевые")
+                tips_f = safe_num_cell(raw_tips, default=0.0)
+
+                if typ == "нал":
+                    final_wo_tips = amount_f
+                    commission = amount_f * (1 - rate_nal)
+                    total = amount_f + tips_f
+                    beznal_added = -commission
+                else:
+                    final_wo_tips = amount_f * rate_card
+                    commission = amount_f - final_wo_tips
+                    total = final_wo_tips + tips_f
+                    beznal_added = final_wo_tips
+
+                cur.execute(
+                    """
+                    INSERT INTO orders (shift_id, type, amount, tips, commission, total, beznal_added, order_time)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        shift_id,
+                        typ,
+                        amount_f,
+                        tips_f,
+                        commission,
+                        total,
+                        beznal_added,
+                        None,
+                    ),
+                )
+
+                if beznal_added != 0:
+                    cur.execute(
+                        """
+                        UPDATE accumulated_beznal
+                        SET total_amount = total_amount + ?
+                        WHERE driver_id = 1
+                        """,
+                        (beznal_added,),
+                    )
+
+                imported += 1
+
+            except Exception as e:
+                st.warning(f"⚠️ Строка {idx}: {e}")
+                errors += 1
+                continue
+
+        conn.commit()
+        conn.close()
+
+        if imported > 0:
+            st.success(f"✅ Импортировано: {imported} заказов")
+            if errors > 0:
+                st.warning(f"⚠️ Ошибок при импорте: {errors}")
+        return imported
+
+    except Exception as e:
+        st.error(f"❌ Ошибка чтения файла: {e}")
+        return 0
+
+
+def reset_db():
+    if os.path.exists(DB_NAME):
+        os.remove(DB_NAME)
+    conn = get_connection()
+    cur = conn.cursor()
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS shifts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             date TEXT NOT NULL,
-            km REAL DEFAULT 0,
+            km INTEGER DEFAULT 0,
             fuel_liters REAL DEFAULT 0,
             fuel_price REAL DEFAULT 0,
-            is_open INTEGER DEFAULT 0
+            is_open INTEGER DEFAULT 1,
+            opened_at TEXT,
+            closed_at TEXT
         )
         """
     )
-
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            shift_id INTEGER NOT NULL,
+            shift_id INTEGER,
             type TEXT NOT NULL,
-            amount REAL DEFAULT 0,
+            amount REAL NOT NULL,
             tips REAL DEFAULT 0,
+            commission REAL NOT NULL,
+            total REAL NOT NULL,
             beznal_added REAL DEFAULT 0,
-            total REAL DEFAULT 0,
-            order_time TEXT,
-            FOREIGN KEY (shift_id) REFERENCES shifts (id)
+            order_time TEXT
         )
         """
     )
-
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS accumulated_beznal (
-            driver_id INTEGER PRIMARY KEY,
-            total_amount REAL DEFAULT 0
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            driver_id INTEGER DEFAULT 1,
+            total_amount REAL DEFAULT 0,
+            last_updated TEXT
         )
         """
     )
-
-    cur.execute(
-        "INSERT OR IGNORE INTO accumulated_beznal (driver_id, total_amount) VALUES (1, 0.0)"
-    )
-
     conn.commit()
     conn.close()
 
 
-def is_db_empty() -> bool:
+def import_from_gsheet(sheet_url: str) -> int:
     """
-    Проверка, что база фактически пустая:
-    нет ни одной записи ни в shifts, ни в orders.
+    Импортирует заказы из Google Sheets.
+
+    Пустые даты или строки без суммы не создают смену.
     """
-    conn = get_connection()
-    cur = conn.cursor()
     try:
-        cur.execute("SELECT COUNT(*) FROM shifts")
-        shifts_count = cur.fetchone()[0] or 0
-    except Exception:
-        shifts_count = 0
-
-    try:
-        cur.execute("SELECT COUNT(*) FROM orders")
-        orders_count = cur.fetchone()[0] or 0
-    except Exception:
-        orders_count = 0
-
-    conn.close()
-    return (shifts_count == 0) and (orders_count == 0)
-
-
-def get_available_year_months():
-    """
-    Месяцы только по закрытым сменам, у которых есть хотя бы один заказ.
-    """
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT DISTINCT strftime('%Y-%m', date)
-        FROM shifts
-        WHERE date IS NOT NULL
-          AND TRIM(date) <> ''
-          AND is_open = 0
-          AND EXISTS (SELECT 1 FROM orders o WHERE o.shift_id = shifts.id)
-        ORDER BY 1 DESC
-        """
-    )
-    rows = cur.fetchall()
-    conn.close()
-
-    res = []
-    for (val,) in rows:
-        if val is None:
-            continue
-        s = str(val)
-        if len(s) >= 7 and s[0:4].isdigit() and s[5:7].isdigit():
-            res.append(s)
-    return res
-
-
-def get_current_accumulated_beznal() -> float:
-    conn = get_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "SELECT total_amount FROM accumulated_beznal WHERE driver_id = 1"
-        )
-        row = cur.fetchone()
-    except Exception:
-        row = None
-    conn.close()
-    return float(row[0]) if row and row[0] is not None else 0.0
-
-
-def get_month_totals(year_month: str | None):
-    """
-    Итоги за месяц по ЗАКРЫТЫМ сменам, где есть хотя бы один заказ.
-    Если year_month is None или нет смен — всё по нулям.
-    """
-    if not year_month:
-        return {
-            "нал": 0.0,
-            "карта": 0.0,
-            "чаевые": 0.0,
-            "безнал_добавлено": 0.0,
-            "всего": 0.0,
-            "смен": 0,
-            "накопленный_безнал": get_current_accumulated_beznal(),
-        }
-
-    conn = get_connection()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT id
-        FROM shifts
-        WHERE date LIKE ?
-          AND is_open = 0
-          AND EXISTS (SELECT 1 FROM orders o WHERE o.shift_id = shifts.id)
-        """,
-        (f"{year_month}%",),
-    )
-    shifts = cur.fetchall()
-
-    total_nal = 0.0
-    total_card = 0.0
-    total_tips = 0.0
-    total_beznal_add = 0.0
-
-    for (shift_id,) in shifts:
-        cur.execute(
-            "SELECT type, SUM(total - tips) "
-            "FROM orders WHERE shift_id = ? GROUP BY type",
-            (shift_id,),
-        )
-        for typ, summ in cur.fetchall():
-            summ = summ or 0.0
-            if typ == "нал":
-                total_nal += summ
-            elif typ == "карта":
-                total_card += summ
-
-        cur.execute(
-            "SELECT SUM(tips), SUM(beznal_added) "
-            "FROM orders WHERE shift_id = ?",
-            (shift_id,),
-        )
-        tips_sum, beznal_sum = cur.fetchone()
-        total_tips += tips_sum or 0.0
-        total_beznal_add += beznal_sum or 0.0
-
-    conn.close()
-
-    current_acc = get_current_accumulated_beznal()
-
-    return {
-        "нал": total_nal,
-        "карта": total_card,
-        "чаевые": total_tips,
-        "безнал_добавлено": total_beznal_add,
-        "всего": total_nal + total_card + total_tips,
-        "смен": len(shifts),
-        "накопленный_безнал": current_acc,
-    }
-
-
-def get_month_shifts_details(year_month: str | None) -> pd.DataFrame:
-    """
-    Одна строка на каждую ЗАКРЫТУЮ смену, у которой есть хотя бы один заказ.
-    Если месяца нет или нет смен — пустой DataFrame.
-    """
-    if not year_month:
-        return pd.DataFrame(
-            columns=[
-                "Дата",
-                "Нал",
-                "Карта",
-                "Чаевые",
-                "Δ безнал",
-                "Км",
-                "Литры",
-                "Цена",
-                "Всего",
-            ]
-        )
-
-    conn = get_connection()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT id, date, km, fuel_liters, fuel_price
-        FROM shifts
-        WHERE date LIKE ?
-          AND is_open = 0
-          AND EXISTS (SELECT 1 FROM orders o WHERE o.shift_id = shifts.id)
-        ORDER BY date
-        """,
-        (f"{year_month}%",),
-    )
-    shifts = cur.fetchall()
-
-    rows = []
-
-    for shift_id, date_str, km, fuel_liters, fuel_price in shifts:
-        cur.execute(
-            "SELECT type, SUM(total - tips) "
-            "FROM orders WHERE shift_id = ? GROUP BY type",
-            (shift_id,),
-        )
-        by_type = {t: s for t, s in cur.fetchall()}
-
-        cur.execute(
-            "SELECT SUM(tips), SUM(beznal_added) "
-            "FROM orders WHERE shift_id = ?",
-            (shift_id,),
-        )
-        tips_sum, beznal_sum = cur.fetchone()
-        tips_sum = tips_sum or 0.0
-        beznal_sum = beznal_sum or 0.0
-
-        nal = by_type.get("нал", 0.0) or 0.0
-        card = by_type.get("карта", 0.0) or 0.0
-        total = nal + card + tips_sum
-
-        rows.append(
-            {
-                "Дата": date_str,
-                "Нал": nal,
-                "Карта": card,
-                "Чаевые": tips_sum,
-                "Δ безнал": beznal_sum,
-                "Км": km or 0,
-                "Литры": fuel_liters or 0.0,
-                "Цена": fuel_price or 0.0,
-                "Всего": total,
-            }
-        )
-
-    conn.close()
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df.index = list(range(1, len(df) + 1))
-    return df
-
-
-def get_closed_shift_id_by_date(date_str: str):
-    """id ЗАКРЫТОЙ смены по дате."""
-    if not date_str:
-        return None
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id FROM shifts WHERE date = ? AND is_open = 0 ORDER BY id LIMIT 1",
-        (date_str,),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-
-def get_shift_orders_df(shift_id: int | None) -> pd.DataFrame:
-    """
-    Заказы в смене: одна строка = один заказ.
-    """
-    if shift_id is None:
-        return pd.DataFrame(
-            columns=["Время", "Тип", "Сумма", "Чаевые", "Δ безнал", "Вам"]
-        )
-
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT type, amount, tips, beznal_added, total, order_time
-        FROM orders
-        WHERE shift_id = ?
-        ORDER BY id
-        """,
-        (shift_id,),
-    )
-    rows = cur.fetchall()
-    conn.close()
-
-    data = []
-    for typ, amount, tips, beznal_added, total, order_time in rows:
-        if typ == "нал":
-            payment_type = "Нал"
-        elif typ == "карта":
-            payment_type = "Карта"
-        else:
-            payment_type = str(typ or "")
-
-        data.append(
-            {
-                "Время": order_time or "",
-                "Тип": payment_type,
-                "Сумма": amount or 0.0,
-                "Чаевые": tips or 0.0,
-                "Δ безнал": beznal_added or 0.0,
-                "Вам": total or 0.0,
-            }
-        )
-
-    df = pd.DataFrame(data)
-    if not df.empty:
-        df.index = list(range(1, len(df) + 1))
-    return df
-
-
-def get_orders_by_hour(date_str: str | None) -> pd.DataFrame:
-    """
-    Кол-во заказов по часам за дату.
-    """
-    if not date_str:
-        return pd.DataFrame({"Час": list(range(24)), "Заказов": [0] * 24})
-
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT o.order_time
-        FROM orders o
-        JOIN shifts s ON o.shift_id = s.id
-        WHERE s.date = ?
-          AND s.is_open = 0
-          AND o.order_time IS NOT NULL
-        """,
-        (date_str,),
-    )
-    rows = cur.fetchall()
-    conn.close()
-
-    times = [r[0] for r in rows]
-
-    if not times:
-        return pd.DataFrame({"Час": list(range(24)), "Заказов": [0] * 24})
-
-    hours = []
-    for t in times:
-        try:
-            s = str(t).strip()
-            if len(s) >= 2 and s[:2].isdigit():
-                h = int(s[:2])
-                if 0 <= h <= 23:
-                    hours.append(h)
-        except Exception:
-            continue
-
-    if not hours:
-        return pd.DataFrame({"Час": list(range(24)), "Заказов": [0] * 24})
-
-    s = pd.Series(hours)
-    counts = s.value_counts().sort_index()
-
-    df = pd.DataFrame({"Час": counts.index, "Заказов": counts.values})
-    full = pd.DataFrame({"Час": list(range(24))})
-    df = full.merge(df, on="Час", how="left").fillna(0)
-    df["Заказов"] = df["Заказов"].astype(int)
-    return df
-
-
-# ===== Импорт из Google Sheets =====
-def load_csv_from_gsheet() -> pd.DataFrame:
-    """Загружает CSV из Google Sheets и чистит данные."""
-    try:
-        # Берём первые 4 колонки вне зависимости от их исходных имён
-        df = pd.read_csv(CSV_URL, header=0, usecols=[0, 1, 2, 3])
+        base_url = sheet_url.split("#")[0]
+        csv_url = base_url.replace("/edit?gid=", "/export?format=csv&gid=")
+        df = pd.read_csv(csv_url)
     except Exception as e:
-        st.error(f"Ошибка при загрузке Google Sheets: {e}")
-        return pd.DataFrame()
+        st.error(f"❌ Не удалось прочитать данные из Google Sheets: {e}")
+        return 0
 
-    # Жёстко задаём ожидаемые имена
-    df.columns = ["Дата", "Тип", "Сумма", "Чаевые"]
+    df.columns = [str(c).strip() for c in df.columns]
+    st.write("📋 Найдены колонки в Google Sheets:", df.columns.tolist())
 
-    # Удаляем полностью пустые строки
-    df = df.dropna(how="all")
+    if "Сумма" not in df.columns:
+        st.error("❌ В таблице нет колонки 'Сумма'.")
+        return 0
 
-    # Чистим дату и тип
-    df["Дата"] = df["Дата"].astype(str).str.strip()
-    df["Тип"] = df["Тип"].astype(str).str.strip()
+    df["Сумма"] = df["Сумма"].replace(r"^\s*$", pd.NA, regex=True)
+    df_clean = df[df["Сумма"].notna()].copy()
 
-    # Убираем строки без даты или без суммы
-    df = df[(df["Дата"] != "") & (~df["Сумма"].isna())]
+    st.write(f"📊 Найдено строк с данными (Сумма не пустая): {len(df_clean)}")
+    st.write("Первые 5 строк:", df_clean.head())
 
-    # Приводим суммы и чаевые к числам
-    df["Сумма"] = pd.to_numeric(df["Сумма"], errors="coerce")
-    df["Чаевые"] = pd.to_numeric(df["Чаевые"], errors="coerce").fillna(0.0)
+    if len(df_clean) == 0:
+        st.error("❌ В таблице нет строк с суммой!")
+        return 0
 
-    # Убираем строки, где сумма так и не распарсилась
-    df = df[~df["Сумма"].isna()]
-
-    # Дата '20.01.26' -> '2026-01-20'
-    df["date_iso"] = pd.to_datetime(
-        df["Дата"], format="%d.%m.%y", dayfirst=True
-    ).dt.strftime("%Y-%m-%d")
-
-    # Маппинг типов оплаты под схему БД
-    type_map = {
-        "Нал": "нал",
-        "нал": "нал",
-        "НАЛ": "нал",
-        "Наличные": "нал",
-        "Безнал": "карта",
-        "безнал": "карта",
-        "БЕЗНАЛ": "карта",
-        "Безналичные": "карта",
-    }
-    df["type_norm"] = df["Тип"].map(type_map).fillna("нал")
-
-    return df
-
-
-def clear_data():
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM orders")
-    cur.execute("DELETE FROM shifts")
-    conn.commit()
-    conn.close()
-
-
-def import_from_gsheet_to_db():
-    """Полный цикл обновления БД из Google Sheets."""
-    init_db()
-    df = load_csv_from_gsheet()
-    if df.empty:
-        st.warning("Не удалось загрузить данные из Google Sheets.")
-        return
-
-    clear_data()
-
+    imported = 0
+    errors = 0
     conn = get_connection()
     cur = conn.cursor()
 
-    for date_iso, group in df.groupby("date_iso"):
-        cur.execute(
-            """
-            INSERT INTO shifts (date, km, fuel_liters, fuel_price, is_open)
-            VALUES (?, 0, 0, 0, 0)
-            """,
-            (date_iso,),
-        )
-        shift_id = cur.lastrowid
+    for idx, row in df_clean.iterrows():
+        try:
+            raw_amount = row.get("Сумма")
+            amount_f = safe_num_cell(raw_amount, default=None)
+            if amount_f is None:
+                st.warning(
+                    f"❌ Строка {idx}: пустая или некорректная сумма ({raw_amount!r}), пропускаю."
+                )
+                errors += 1
+                continue
 
-        for _, row in group.iterrows():
-            amount = float(row["Сумма"])
-            tips = float(row["Чаевые"])
-            typ = row["type_norm"]
-            total = amount + tips
+            raw_date = row.get("Дата")
+            date_str = safe_str_cell(raw_date)
+            if not date_str:
+                st.warning(
+                    f"❌ Строка {idx}: пустая дата при сумме {amount_f}, пропускаю."
+                )
+                errors += 1
+                continue
+
+            cur.execute("SELECT id FROM shifts WHERE date = ?", (date_str,))
+            s = cur.fetchone()
+            if s:
+                shift_id = s[0]
+            else:
+                cur.execute(
+                    "INSERT INTO shifts (date, is_open, opened_at, closed_at) "
+                    "VALUES (?, 0, ?, ?)",
+                    (date_str, date_str, date_str),
+                )
+                shift_id = cur.lastrowid
+
+            raw_type = row.get("Тип", "нал")
+            raw_type_str = safe_str_cell(raw_type, default="нал").lower()
+            if raw_type_str in ("безнал", "card", "карта"):
+                typ = "карта"
+            else:
+                typ = "нал"
+
+            raw_tips = row.get("Чаевые")
+            tips_f = safe_num_cell(raw_tips, default=0.0)
+
+            if typ == "нал":
+                final_wo_tips = amount_f
+                commission = amount_f * (1 - rate_nal)
+                total = amount_f + tips_f
+                beznal_added = -commission
+            else:
+                final_wo_tips = amount_f * rate_card
+                commission = amount_f - final_wo_tips
+                total = final_wo_tips + tips_f
+                beznal_added = final_wo_tips
 
             cur.execute(
                 """
-                INSERT INTO orders (shift_id, type, amount, tips, beznal_added, total, order_time)
-                VALUES (?, ?, ?, ?, 0, ?, NULL)
+                INSERT INTO orders (shift_id, type, amount, tips, commission, total, beznal_added, order_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (shift_id, typ, amount, tips, total),
+                (
+                    shift_id,
+                    typ,
+                    amount_f,
+                    tips_f,
+                    commission,
+                    total,
+                    beznal_added,
+                    None,
+                ),
             )
+
+            if beznal_added != 0:
+                cur.execute(
+                    """
+                    UPDATE accumulated_beznal
+                    SET total_amount = total_amount + ?
+                    WHERE driver_id = 1
+                    """,
+                    (beznal_added,),
+                )
+
+            imported += 1
+
+        except Exception as e:
+            st.warning(f"⚠️ Строка {idx}: {e}")
+            errors += 1
+            continue
 
     conn.commit()
     conn.close()
-    st.success("Данные из Google Sheets успешно загружены в базу.")
+
+    if imported > 0:
+        st.success(f"✅ Импортировано из Google Sheets: {imported} заказов")
+        if errors > 0:
+            st.warning(f"⚠️ Ошибок при импорте: {errors}")
+    return imported
 
 
-# ===== Справочники =====
-month_name = {
-    1: "январь",
-    2: "февраль",
-    3: "март",
-    4: "апрель",
-    5: "май",
-    6: "июнь",
-    7: "июль",
-    8: "август",
-    9: "сентябрь",
-    10: "октябрь",
-    11: "ноябрь",
-    12: "декабрь",
-}
+# ===== UI / ЗАПУСК СТРАНИЦЫ =====
 
+st.set_page_config(page_title="Администрирование", page_icon="🛠", layout="centered")
+st.title("🛠 Администрирование")
 
-def format_month_option(s) -> str:
-    if s is None or s == "":
-        return "—"
-    s_str = str(s)
-    if len(s_str) >= 7:
-        mm = s_str[5:7]
-        if mm.isdigit():
-            m = int(mm)
-            return f"{s_str} ({month_name.get(m, '')})"
-    return s_str or "—"
+if not check_admin_auth():
+    st.stop()
 
-
-# ===== UI =====
-st.set_page_config(page_title="Отчёты", page_icon="📊", layout="centered")
-st.title("📊 Отчёты")
-
-# Кнопка обновления из Google Sheets
-with st.expander("🔄 Обновление данных", expanded=False):
-    st.write(
-        "Нажмите кнопку ниже, чтобы загрузить данные из Google Sheets "
-        "и обновить базу `taxi.db`."
-    )
-    if st.button("Обновить данные из Google Sheets"):
-        with st.spinner("Загружаем данные из Google Sheets..."):
-            import_from_gsheet_to_db()
-        st.experimental_rerun()
-
-# Основной блок отчётов
-init_db()
-db_empty = is_db_empty()
-year_months = get_available_year_months()
-
-if db_empty:
-    st.info(
-        "База данных пока пуста: нет ни смен, ни заказов.\n\n"
-        "Отчёты ниже будут пустыми, пока вы не добавите данные или не обновите их из Google Sheets."
+# 0. Импорт из Google Sheets
+with st.expander("📄 Заливка базы из Google Sheets", expanded=False):
+    st.caption(
+        "Таблица должна быть доступна по ссылке (Anyone with link, Viewer). "
+        "Формат колонок: Дата, Тип, Сумма, Чаевые."
     )
 
-if not year_months:
-    month_options = [""]
-else:
-    month_options = year_months
-
-ym = st.selectbox(
-    "Выберите месяц",
-    month_options,
-    format_func=format_month_option,
-)
-
-df_shifts = get_month_shifts_details(ym if ym else None)
-totals = get_month_totals(ym if ym else None)
-
-st.write("---")
-
-# 1. ОТЧЁТ ПО ОДНОЙ СМЕНЕ
-st.subheader("📄 Отчёт по смене")
-
-if df_shifts.empty:
-    st.write("Нет закрытых смен с заказами за выбранный месяц.")
-    selected_date = None
-else:
-    available_dates = df_shifts["Дата"].unique().tolist()
-    selected_date = st.selectbox(
-        "Дата смены",
-        options=available_dates,
+    default_url = (
+        "https://docs.google.com/spreadsheets/d/"
+        "1USdDnw5OnzcIgC0mBVWGKURDJox4ncc5SAUQn-euS3Q/edit?gid=0#gid=0"
     )
+    sheet_url = st.text_input("Ссылка на Google Sheets", value=default_url)
 
-    df_shift_summary = df_shifts[df_shifts["Дата"] == selected_date].copy()
-    if not df_shift_summary.empty:
-        df_shift_summary.index = list(range(1, len(df_shift_summary) + 1))
+    if st.button("Импортировать из Google Sheets"):
+        imported = import_from_gsheet(sheet_url)
+        if imported > 0:
+            st.info("После импорта можно открыть страницу Reports и посмотреть отчёты.")
 
-    st.dataframe(
-        df_shift_summary.style.format(
-            {
-                "Нал": "{:.0f}",
-                "Карта": "{:.0f}",
-                "Чаевые": "{:.0f}",
-                "Δ безнал": "{:.0f}",
-                "Км": "{:.0f}",
-                "Литры": "{:.1f}",
-                "Цена": "{:.1f}",
-                "Всего": "{:.0f}",
-            }
-        ),
-        width="stretch",
+# 1. Импорт из файла (Excel / CSV)
+with st.expander("📂 Импорт из файла (Excel / CSV)", expanded=False):
+    uploaded_file = st.file_uploader("Выберите файл Excel или CSV", type=["xlsx", "xls", "csv"])
+    if uploaded_file is not None:
+        if st.button("Импортировать из файла"):
+            imported = import_from_excel(uploaded_file)
+            if imported > 0:
+                st.info("Импорт завершён. Проверьте данные в отчётах (страница Reports).")
+
+# 2. Пересчёт базы
+with st.expander("🔄 Пересчитать комиссии и безнал по всем заказам", expanded=False):
+    if st.button("Пересчитать всё"):
+        recalc_full_db()
+        st.success("Пересчёт завершён.")
+        st.write(f"Текущий накопленный безнал: {get_accumulated_beznal():.0f} ₽")
+
+# 3. Сброс базы
+with st.expander("⚠️ Полный сброс базы", expanded=False):
+    st.warning(
+        "Эта операция удалит все смены и заказы и создаст пустую базу заново. "
+        "Используйте только если точно понимаете, что делаете."
     )
-
-    st.markdown("**Заказы в смене**")
-
-    shift_id = get_closed_shift_id_by_date(selected_date)
-    df_orders = get_shift_orders_df(shift_id)
-    if df_orders.empty:
-        st.write("Нет заказов для выбранной смены.")
-    else:
-        st.dataframe(
-            df_orders.style.format(
-                {
-                    "Сумма": "{:.0f}",
-                    "Чаевые": "{:.0f}",
-                    "Δ безнал": "{:.0f}",
-                    "Вам": "{:.0f}",
-                }
-            ),
-            width="stretch",
-        )
-
-st.markdown("**График заказов по часам**")
-df_hours = get_orders_by_hour(selected_date if selected_date else None)
-df_hours["Час"] = df_hours["Час"].apply(lambda h: f"{h:02d}:00")
-st.bar_chart(
-    data=df_hours,
-    x="Час",
-    y="Заказов",
-)
-
-# 2. ОТЧЁТ ПО СМЕНАМ ЗА МЕСЯЦ
-st.write("---")
-st.subheader("📅 Отчёт по сменам (таблица)")
-
-if df_shifts.empty:
-    st.write("Нет детальных данных по сменам за выбранный месяц.")
-else:
-    st.dataframe(
-        df_shifts.style.format(
-            {
-                "Нал": "{:.0f}",
-                "Карта": "{:.0f}",
-                "Чаевые": "{:.0f}",
-                "Δ безнал": "{:.0f}",
-                "Км": "{:.0f}",
-                "Литры": "{:.1f}",
-                "Цена": "{:.1f}",
-                "Всего": "{:.0f}",
-            }
-        ),
-        width="stretch",
-    )
-
-# 3. ОТЧЁТ ЗА МЕСЯЦ (ИТОГИ)
-st.write("---")
-st.subheader("📊 Отчёт за месяц")
-
-col1, col2, col3 = st.columns(3)
-col1.metric("Нал", f"{totals['нал']:.0f} ₽")
-col2.metric("Карта", f"{totals['карта']:.0f} ₽")
-col3.metric("Чаевые", f"{totals['чаевые']:.0f} ₽")
-
-col4, col5, col6 = st.columns(3)
-col4.metric("Изм. безнала (за месяц)", f"{totals['безнал_добавлено']:.0f} ₽")
-col5.metric("Накопленный безнал (текущий)", f"{totals['накопленный_безнал']:.0f} ₽")
-col6.metric("Смен", f"{totals['смен']}")
-
-total_income = totals["всего"]
-fuel_cost = float((df_shifts["Литры"].fillna(0) * df_shifts["Цена"].fillna(0)).sum()) if not df_shifts.empty else 0.0
-profit = total_income - fuel_cost
-
-st.write("---")
-st.subheader("💰 Финансовый результат за месяц")
-
-col7, col8, col9 = st.columns(3)
-col7.metric("Доход (всего)", f"{total_income:.0f} ₽")
-col8.metric("Бензин (расход)", f"{fuel_cost:.0f} ₽")
-col9.metric("Прибыль (≈)", f"{profit:.0f} ₽")
+    if st.button("Удалить базу и создать заново"):
+        reset_db()
+        st.success("База сброшена и создана заново.")

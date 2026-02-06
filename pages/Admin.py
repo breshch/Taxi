@@ -89,6 +89,7 @@ def get_accumulated_beznal():
 
 
 def recalc_full_db():
+    """Пересчитать комиссии, total и безнал по всем заказам и обновить accumulated_beznal."""
     conn = get_connection()
     cur = conn.cursor()
 
@@ -119,6 +120,7 @@ def recalc_full_db():
             (commission, total, beznal_added, order_id),
         )
 
+    # пересчёт накопленного безнала
     cur.execute("SELECT COALESCE(SUM(beznal_added), 0) FROM orders")
     total_beznal = cur.fetchone()[0] or 0.0
 
@@ -541,6 +543,34 @@ with st.expander("🔄 Пересчитать комиссии и безнал �
         st.success("Пересчёт завершён.")
     st.write(f"Текущий накопленный безнал: {get_accumulated_beznal():.0f} ₽")
 
+# 2.1 Установить накопленный безнал вручную
+with st.expander("✏️ Установить накопленный безнал вручную", expanded=False):
+    current = get_accumulated_beznal()
+    st.write(f"Сейчас в базе: {current:.0f} ₽")
+
+    new_value = st.number_input(
+        "Новое значение накопленного безнала, ₽",
+        min_value=0.0,
+        step=100.0,
+        format="%.0f",
+    )
+
+    if st.button("Сохранить это значение в базу"):
+        conn = get_connection()
+        cur = conn.cursor()
+        ensure_accum_row(cur)
+        cur.execute(
+            """
+            UPDATE accumulated_beznal
+            SET total_amount = ?, last_updated = ?
+            WHERE driver_id = 1
+            """,
+            (new_value, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        conn.commit()
+        conn.close()
+        st.success(f"В базе теперь записано: {new_value:.0f} ₽")
+
 # 3. Сброс базы
 with st.expander("⚠️ Полный сброс базы", expanded=False):
     st.warning(
@@ -550,55 +580,3 @@ with st.expander("⚠️ Полный сброс базы", expanded=False):
     if st.button("Удалить базу и создать заново"):
         reset_db()
         st.success("База сброшена и создана заново.")
-# 2.1 Операции с накопленным безналом
-with st.expander("💳 Операции с накопленным безналом", expanded=False):
-    st.write(f"Сейчас накоплено: {get_accumulated_beznal():.0f} ₽")
-
-    amount = st.number_input(
-        "Сумма операции, ₽",
-        min_value=0.0,
-        step=100.0,
-        format="%.0f"
-    )
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        if st.button("Списать с безнала"):
-            if amount <= 0:
-                st.warning("Введите сумму больше нуля.")
-            else:
-                conn = get_connection()
-                cur = conn.cursor()
-                ensure_accum_row(cur)
-                cur.execute(
-                    """
-                    UPDATE accumulated_beznal
-                    SET total_amount = total_amount - ?, last_updated = ?
-                    WHERE driver_id = 1
-                    """,
-                    (amount, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-                )
-                conn.commit()
-                conn.close()
-                st.success(f"Списано {amount:.0f} ₽ с накопленного безнала.")
-
-    with col2:
-        if st.button("Зачислить к безналу"):
-            if amount <= 0:
-                st.warning("Введите сумму больше нуля.")
-            else:
-                conn = get_connection()
-                cur = conn.cursor()
-                ensure_accum_row(cur)
-                cur.execute(
-                    """
-                    UPDATE accumulated_beznal
-                    SET total_amount = total_amount + ?, last_updated = ?
-                    WHERE driver_id = 1
-                    """,
-                    (amount, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-                )
-                conn.commit()
-                conn.close()
-                st.success(f"Зачислено {amount:.0f} ₽ к накопленному безналу.")

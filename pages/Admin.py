@@ -12,7 +12,7 @@ rate_card = 0.75
 
 # ===== ПРОСТАЯ АВТОРИЗАЦИЯ ДЛЯ АДМИНКИ =====
 
-ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "changeme")
+ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "5484")
 
 
 def check_admin_auth() -> bool:

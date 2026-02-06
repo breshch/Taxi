@@ -183,7 +183,7 @@ def get_month_shifts_details(year_month: str) -> pd.DataFrame:
 
         rows.append(
             {
-                "Дата": date_str,
+                "Дата": date_str,  # сырая дата из БД
                 "Нал": nal,
                 "Карта": card,
                 "Чаевые": tips_sum,
@@ -306,18 +306,15 @@ def get_orders_by_hour(date_str: str) -> pd.DataFrame:
 
 
 def format_month_option(s) -> str:
-    """Отображаем месяц как MM.YYYY вместо YYYY-MM."""
+    """В селекте показываем месяц как MM.YYYY вместо YYYY-MM."""
     if s is None:
         return "—"
     s_str = str(s).strip()
-    # ожидаем строку вида YYYY-MM
     try:
         dt = pd.to_datetime(s_str + "-01", format="%Y-%m-%d", errors="raise")
         return dt.strftime("%m.%Y")
     except Exception:
-        # если формат необычный, показываем как есть
         return s_str or "—"
-
 
 
 # ===== UI =====
@@ -343,6 +340,7 @@ st.subheader("📄 Отчёт по смене")
 if df_shifts.empty:
     st.write("Пока нет смен за выбранный месяц.")
 else:
+    # выбор даты по сырому значению из БД
     available_dates = df_shifts["Дата"].unique().tolist()
     selected_date = st.selectbox(
         "Дата смены",
@@ -350,11 +348,18 @@ else:
     )
 
     df_shift_summary = df_shifts[df_shifts["Дата"] == selected_date].copy()
-    if not df_shift_summary.empty:
-        df_shift_summary.index = list(range(1, len(df_shift_summary) + 1))
+
+    # отдельный датафрейм только для отображения: форматируем дату как дд.мм.гггг
+    df_shift_display = df_shift_summary.copy()
+    dt_series = pd.to_datetime(df_shift_display["Дата"], dayfirst=True, errors="coerce")
+    mask = dt_series.notna()
+    df_shift_display.loc[mask, "Дата"] = dt_series[mask].dt.strftime("%d.%m.%Y")
+
+    if not df_shift_display.empty:
+        df_shift_display.index = list(range(1, len(df_shift_display) + 1))
 
     st.dataframe(
-        df_shift_summary.style.format(
+        df_shift_display.style.format(
             {
                 "Нал": "{:.0f}",
                 "Карта": "{:.0f}",
@@ -406,8 +411,17 @@ st.subheader("📅 Отчёт по сменам (таблица)")
 if df_shifts.empty:
     st.write("Нет детальных данных по сменам за выбранный месяц.")
 else:
+    df_shifts_display = df_shifts.copy()
+    dt_series_all = pd.to_datetime(
+        df_shifts_display["Дата"], dayfirst=True, errors="coerce"
+    )
+    mask_all = dt_series_all.notna()
+    df_shifts_display.loc[mask_all, "Дата"] = dt_series_all[mask_all].dt.strftime(
+        "%d.%m.%Y"
+    )
+
     st.dataframe(
-        df_shifts.style.format(
+        df_shifts_display.style.format(
             {
                 "Нал": "{:.0f}",
                 "Карта": "{:.0f}",
@@ -456,4 +470,3 @@ c3.metric("Прибыль (≈)", f"{profit:.0f} ₽")
 st.write(
     "_Примечание: прибыль указана приблизительно, без учёта других возможных расходов._"
 )
-st.write("---")

@@ -43,7 +43,22 @@ def get_connection():
     return sqlite3.connect(DB_NAME)
 
 
-def safe_str_cell(v, default: str = "") -> str:
+def ensure_accum_row(cur):
+    """Гарантируем, что есть строка driver_id=1 в accumulated_beznal."""
+    cur.execute("SELECT id FROM accumulated_beznal WHERE driver_id = 1")
+    row = cur.fetchone()
+    if not row:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cur.execute(
+            """
+            INSERT INTO accumulated_beznal (driver_id, total_amount, last_updated)
+            VALUES (1, 0, ?)
+            """,
+            (now,),
+        )
+
+
+def safe_str_cell(v, default=""):
     """Строка из ячейки: пустые/NaN -> default."""
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return default
@@ -51,8 +66,8 @@ def safe_str_cell(v, default: str = "") -> str:
     return s if s != "" else default
 
 
-def safe_num_cell(v, default: float = 0.0) -> float | None:
-    """Число из ячейки: пустые/NaN/мусор -> default (или None)."""
+def safe_num_cell(v, default=0.0):
+    """Число из ячейки: пустые/NaN/мусор -> default."""
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return default
     s = str(v).strip().replace(",", ".")
@@ -74,7 +89,6 @@ def get_accumulated_beznal():
 
 
 def recalc_full_db():
-    """Пересчитать комиссию, total и безнал по всем заказам и обновить accumulated_beznal."""
     conn = get_connection()
     cur = conn.cursor()
 
@@ -105,7 +119,6 @@ def recalc_full_db():
             (commission, total, beznal_added, order_id),
         )
 
-    # пересчёт накопленного безнала
     cur.execute("SELECT COALESCE(SUM(beznal_added), 0) FROM orders")
     total_beznal = cur.fetchone()[0] or 0.0
 
@@ -169,6 +182,7 @@ def import_from_excel(uploaded_file) -> int:
 
         conn = get_connection()
         cur = conn.cursor()
+        ensure_accum_row(cur)
 
         for idx, row in df_clean.iterrows():
             try:
@@ -331,6 +345,9 @@ def reset_db():
         """
     )
 
+    # создаём строку driver_id=1
+    ensure_accum_row(cur)
+
     conn.commit()
     conn.close()
 
@@ -371,6 +388,7 @@ def import_from_gsheet(sheet_url: str) -> int:
 
     conn = get_connection()
     cur = conn.cursor()
+    ensure_accum_row(cur)
 
     for idx, row in df_clean.iterrows():
         try:

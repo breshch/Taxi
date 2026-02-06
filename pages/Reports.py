@@ -305,33 +305,11 @@ def get_orders_by_hour(date_str: str) -> pd.DataFrame:
     return df
 
 
-# ===== Справочники =====
-month_name = {
-    1: "январь",
-    2: "февраль",
-    3: "март",
-    4: "апрель",
-    5: "май",
-    6: "июнь",
-    7: "июль",
-    8: "август",
-    9: "сентябрь",
-    10: "октябрь",
-    11: "ноябрь",
-    12: "декабрь",
-}
-
-
 def format_month_option(s) -> str:
+    """Возвращаем месяц как есть, без добавления названий."""
     if s is None:
         return "—"
-    s_str = str(s)
-    if len(s_str) >= 7:
-        mm = s_str[5:7]
-        if mm.isdigit():
-            m = int(mm)
-            return f"{s_str} ({month_name.get(m, '')})"
-    return s_str or "—"
+    return str(s)
 
 
 # ===== UI =====
@@ -470,3 +448,4 @@ c3.metric("Прибыль (≈)", f"{profit:.0f} ₽")
 st.write(
     "_Примечание: прибыль указана приблизительно, без учёта других возможных расходов._"
 )
+st.write("---")

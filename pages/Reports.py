@@ -12,37 +12,44 @@ def get_connection():
 
 def get_available_year_months():
     """
-    Месяцы по всем сменам (и открытым, и закрытым).
-    Если в базе совсем нет смен, возвращаем текущий месяц,
-    чтобы отчёты всегда открывались.
+    Список месяцев по всем сменам.
+    Даты парсим в Python, чтобы учесть любые форматы (в т.ч. старые типа 20.01.26).
+    Если смен нет или все даты битые, возвращаем текущий месяц.
     """
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT DISTINCT strftime('%Y-%m', date)
+        SELECT DISTINCT date
         FROM shifts
         WHERE date IS NOT NULL
           AND TRIM(date) <> ''
-        ORDER BY 1 DESC
         """
     )
     rows = cur.fetchall()
     conn.close()
 
-    res = []
-    for (val,) in rows:
-        if val is None:
+    months = set()
+
+    for (date_val,) in rows:
+        if date_val is None:
             continue
-        s = str(val)
-        if len(s) >= 7 and s[0:4].isdigit() and s[5:7].isdigit():
-            res.append(s)
+        s = str(date_val).strip()
+        if not s:
+            continue
 
-    # если смен нет вообще — показываем текущий год-месяц
-    if not res:
+        dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
+        if pd.isna(dt):
+            continue
+
+        ym = dt.strftime("%Y-%m")
+        months.add(ym)
+
+    if not months:
         today = pd.Timestamp.today()
-        res = [today.strftime("%Y-%m")]
+        months = {today.strftime("%Y-%m")}
 
+    res = sorted(months, reverse=True)
     return res
 
 

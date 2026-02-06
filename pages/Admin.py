@@ -10,7 +10,7 @@ rate_nal = 0.78
 rate_card = 0.75
 
 # ===== ПРОСТАЯ АВТОРИЗАЦИЯ ДЛЯ АДМИНКИ =====
-ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "5484")
+ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "changeme")
 
 
 def check_admin_auth() -> bool:
@@ -550,3 +550,55 @@ with st.expander("⚠️ Полный сброс базы", expanded=False):
     if st.button("Удалить базу и создать заново"):
         reset_db()
         st.success("База сброшена и создана заново.")
+# 2.1 Операции с накопленным безналом
+with st.expander("💳 Операции с накопленным безналом", expanded=False):
+    st.write(f"Сейчас накоплено: {get_accumulated_beznal():.0f} ₽")
+
+    amount = st.number_input(
+        "Сумма операции, ₽",
+        min_value=0.0,
+        step=100.0,
+        format="%.0f"
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button("Списать с безнала"):
+            if amount <= 0:
+                st.warning("Введите сумму больше нуля.")
+            else:
+                conn = get_connection()
+                cur = conn.cursor()
+                ensure_accum_row(cur)
+                cur.execute(
+                    """
+                    UPDATE accumulated_beznal
+                    SET total_amount = total_amount - ?, last_updated = ?
+                    WHERE driver_id = 1
+                    """,
+                    (amount, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                )
+                conn.commit()
+                conn.close()
+                st.success(f"Списано {amount:.0f} ₽ с накопленного безнала.")
+
+    with col2:
+        if st.button("Зачислить к безналу"):
+            if amount <= 0:
+                st.warning("Введите сумму больше нуля.")
+            else:
+                conn = get_connection()
+                cur = conn.cursor()
+                ensure_accum_row(cur)
+                cur.execute(
+                    """
+                    UPDATE accumulated_beznal
+                    SET total_amount = total_amount + ?, last_updated = ?
+                    WHERE driver_id = 1
+                    """,
+                    (amount, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                )
+                conn.commit()
+                conn.close()
+                st.success(f"Зачислено {amount:.0f} ₽ к накопленному безналу.")

@@ -11,6 +11,29 @@ def get_connection():
     return sqlite3.connect(DB_NAME)
 
 
+def is_db_empty() -> bool:
+    """
+    Проверка, что база фактически пустая:
+    нет ни одной записи ни в shifts, ни в orders.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT COUNT(*) FROM shifts")
+        shifts_count = cur.fetchone()[0] or 0
+    except Exception:
+        shifts_count = 0
+
+    try:
+        cur.execute("SELECT COUNT(*) FROM orders")
+        orders_count = cur.fetchone()[0] or 0
+    except Exception:
+        orders_count = 0
+
+    conn.close()
+    return (shifts_count == 0) and (orders_count == 0)
+
+
 def get_available_year_months():
     """
     Месяцы только по закрытым сменам, у которых есть хотя бы один заказ.
@@ -320,11 +343,21 @@ def format_month_option(s) -> str:
 st.set_page_config(page_title="Отчёты", page_icon="📊", layout="centered")
 st.title("📊 Отчёты")
 
+# Проверка, пустая ли база
+if is_db_empty():
+    st.info(
+        "База данных пока пуста: нет ни смен, ни заказов.\n\n"
+        "Создайте хотя бы одну смену и один заказ, после этого здесь появятся отчёты."
+    )
+    st.stop()
+
 year_months = get_available_year_months()
 
 if not year_months:
-    st.info("Пока нет закрытых смен с заказами. Как только появятся, здесь будут отчёты за месяц.")
-    # Показываем пустой интерфейс без selectbox
+    st.info(
+        "В базе есть данные, но пока нет закрытых смен с заказами.\n\n"
+        "Закройте хотя бы одну смену с заказами, и здесь появятся отчёты за месяц."
+    )
     st.stop()
 
 ym = st.selectbox(

@@ -2,7 +2,6 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 
-
 DB_NAME = "taxi.db"
 
 
@@ -11,94 +10,9 @@ def get_connection():
     return sqlite3.connect(DB_NAME)
 
 
-def init_db():
-    """Создаём таблицы, если их ещё нет (совместимо с Admin.py)."""
-    conn = get_connection()
-    cur = conn.cursor()
-
-    # shifts
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS shifts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT NOT NULL,
-            km INTEGER DEFAULT 0,
-            fuel_liters REAL DEFAULT 0,
-            fuel_price REAL DEFAULT 0,
-            is_open INTEGER DEFAULT 1,
-            opened_at TEXT,
-            closed_at TEXT
-        )
-        """
-    )
-
-    # orders
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            shift_id INTEGER,
-            type TEXT NOT NULL,
-            amount REAL NOT NULL,
-            tips REAL DEFAULT 0,
-            commission REAL NOT NULL,
-            total REAL NOT NULL,
-            beznal_added REAL DEFAULT 0,
-            order_time TEXT
-        )
-        """
-    )
-
-    # accumulated_beznal
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS accumulated_beznal (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            driver_id INTEGER DEFAULT 1,
-            total_amount REAL DEFAULT 0,
-            last_updated TEXT
-        )
-        """
-    )
-
-    # гарантия записи для driver_id = 1
-    cur.execute(
-        """
-        INSERT INTO accumulated_beznal (driver_id, total_amount, last_updated)
-        SELECT 1, 0, NULL
-        WHERE NOT EXISTS (
-            SELECT 1 FROM accumulated_beznal WHERE driver_id = 1
-        )
-        """
-    )
-
-    conn.commit()
-    conn.close()
-
-
-def is_db_empty() -> bool:
-    conn = get_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT COUNT(*) FROM shifts")
-        shifts_count = cur.fetchone()[0] or 0
-    except Exception:
-        shifts_count = 0
-
-    try:
-        cur.execute("SELECT COUNT(*) FROM orders")
-        orders_count = cur.fetchone()[0] or 0
-    except Exception:
-        orders_count = 0
-
-    conn.close()
-    return (shifts_count == 0) and (orders_count == 0)
-
-
 def get_available_year_months():
     """
     Месяцы только по закрытым сменам, у которых есть хотя бы один заказ.
-    (is_open = 0 и есть строки в orders).
     """
     conn = get_connection()
     cur = conn.cursor()
@@ -129,38 +43,18 @@ def get_available_year_months():
 def get_current_accumulated_beznal() -> float:
     conn = get_connection()
     cur = conn.cursor()
-    try:
-        cur.execute(
-            "SELECT total_amount FROM accumulated_beznal "
-            "WHERE driver_id = 1 ORDER BY id DESC LIMIT 1"
-        )
-        row = cur.fetchone()
-    except Exception:
-        row = None
+    cur.execute(
+        "SELECT total_amount FROM accumulated_beznal WHERE driver_id = 1"
+    )
+    row = cur.fetchone()
     conn.close()
     return float(row[0]) if row and row[0] is not None else 0.0
 
 
-def get_month_totals(year_month: str | None):
+def get_month_totals(year_month: str):
     """
     Итоги за месяц по ЗАКРЫТЫМ сменам, где есть хотя бы один заказ.
-    Берём:
-      - 'нал'  = SUM(total - tips) по type='нал'
-      - 'карта' = SUM(total - tips) по type='карта'
-      - чаевые = SUM(tips)
-      - безнал_добавлено = SUM(beznal_added)
     """
-    if not year_month:
-        return {
-            "нал": 0.0,
-            "карта": 0.0,
-            "чаевые": 0.0,
-            "безнал_добавлено": 0.0,
-            "всего": 0.0,
-            "смен": 0,
-            "накопленный_безнал": get_current_accumulated_beznal(),
-        }
-
     conn = get_connection()
     cur = conn.cursor()
 
@@ -182,7 +76,6 @@ def get_month_totals(year_month: str | None):
     total_beznal_add = 0.0
 
     for (shift_id,) in shifts:
-        # разбор по типам оплаты
         cur.execute(
             "SELECT type, SUM(total - tips) "
             "FROM orders WHERE shift_id = ? GROUP BY type",
@@ -195,7 +88,6 @@ def get_month_totals(year_month: str | None):
             elif typ == "карта":
                 total_card += summ
 
-        # чаевые и изменение безнала
         cur.execute(
             "SELECT SUM(tips), SUM(beznal_added) "
             "FROM orders WHERE shift_id = ?",
@@ -220,26 +112,11 @@ def get_month_totals(year_month: str | None):
     }
 
 
-def get_month_shifts_details(year_month: str | None) -> pd.DataFrame:
+def get_month_shifts_details(year_month: str) -> pd.DataFrame:
     """
     Одна строка на каждую ЗАКРЫТУЮ смену, у которой есть хотя бы один заказ.
-    Км/литры/цена берутся из таблицы shifts.
+    Км/расход/цена берутся только из закрытия смены.
     """
-    if not year_month:
-        return pd.DataFrame(
-            columns=[
-                "Дата",
-                "Нал",
-                "Карта",
-                "Чаевые",
-                "Δ безнал",
-                "Км",
-                "Литры",
-                "Цена",
-                "Всего",
-            ]
-        )
-
     conn = get_connection()
     cur = conn.cursor()
 
@@ -277,7 +154,13 @@ def get_month_shifts_details(year_month: str | None) -> pd.DataFrame:
 
         nal = by_type.get("нал", 0.0) or 0.0
         card = by_type.get("карта", 0.0) or 0.0
-        total = nal + card + tips_sum
+
+        liters = fuel_liters or 0.0
+        price = fuel_price or 0.0
+        fuel_cost = liters * price
+
+        income = nal + card + tips_sum
+        net = income - fuel_cost
 
         rows.append(
             {
@@ -287,9 +170,10 @@ def get_month_shifts_details(year_month: str | None) -> pd.DataFrame:
                 "Чаевые": tips_sum,
                 "Δ безнал": beznal_sum,
                 "Км": km or 0,
-                "Литры": fuel_liters or 0.0,
-                "Цена": fuel_price or 0.0,
-                "Всего": total,
+                "Расход, л": liters,
+                "Цена, ₽/л": price,
+                "Бензин, ₽": fuel_cost,
+                "Чистыми, ₽": net,
             }
         )
 
@@ -301,8 +185,7 @@ def get_month_shifts_details(year_month: str | None) -> pd.DataFrame:
 
 
 def get_closed_shift_id_by_date(date_str: str):
-    if not date_str:
-        return None
+    """id ЗАКРЫТОЙ смены по дате."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -315,10 +198,11 @@ def get_closed_shift_id_by_date(date_str: str):
 
 
 def get_shift_orders_df(shift_id: int | None) -> pd.DataFrame:
+    """
+    Заказы в смене: одна строка = один заказ.
+    """
     if shift_id is None:
-        return pd.DataFrame(
-            columns=["Время", "Тип", "Сумма", "Чаевые", "Δ безнал", "Вам"]
-        )
+        return pd.DataFrame()
 
     conn = get_connection()
     cur = conn.cursor()
@@ -336,17 +220,10 @@ def get_shift_orders_df(shift_id: int | None) -> pd.DataFrame:
 
     data = []
     for typ, amount, tips, beznal_added, total, order_time in rows:
-        if typ == "нал":
-            payment_type = "Нал"
-        elif typ == "карта":
-            payment_type = "Карта"
-        else:
-            payment_type = str(typ or "")
-
         data.append(
             {
                 "Время": order_time or "",
-                "Тип": payment_type,
+                "Тип": "Нал" if typ == "нал" else "Карта",
                 "Сумма": amount or 0.0,
                 "Чаевые": tips or 0.0,
                 "Δ безнал": beznal_added or 0.0,
@@ -360,10 +237,10 @@ def get_shift_orders_df(shift_id: int | None) -> pd.DataFrame:
     return df
 
 
-def get_orders_by_hour(date_str: str | None) -> pd.DataFrame:
-    if not date_str:
-        return pd.DataFrame({"Час": list(range(24)), "Заказов": [0] * 24})
-
+def get_orders_by_hour(date_str: str) -> pd.DataFrame:
+    """
+    Кол-во заказов по часам за дату.
+    """
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -388,11 +265,9 @@ def get_orders_by_hour(date_str: str | None) -> pd.DataFrame:
     hours = []
     for t in times:
         try:
-            s = str(t).strip()
-            if len(s) >= 2 and s[:2].isdigit():
-                h = int(s[:2])
-                if 0 <= h <= 23:
-                    hours.append(h)
+            h = int(str(t)[0:2])
+            if 0 <= h <= 23:
+                hours.append(h)
         except Exception:
             continue
 
@@ -409,7 +284,7 @@ def get_orders_by_hour(date_str: str | None) -> pd.DataFrame:
     return df
 
 
-# ===== Справочник месяцев =====
+# ===== Справочники =====
 month_name = {
     1: "январь",
     2: "февраль",
@@ -427,7 +302,7 @@ month_name = {
 
 
 def format_month_option(s) -> str:
-    if s is None or s == "":
+    if s is None:
         return "—"
     s_str = str(s)
     if len(s_str) >= 7:
@@ -442,38 +317,31 @@ def format_month_option(s) -> str:
 st.set_page_config(page_title="Отчёты", page_icon="📊", layout="centered")
 st.title("📊 Отчёты")
 
-init_db()
-db_empty = is_db_empty()
 year_months = get_available_year_months()
 
-if db_empty:
-    st.info(
-        "База данных пока пуста: нет ни смен, ни заказов.\n\n"
-        "Залейте данные через страницу Admin, затем вернитесь сюда."
-    )
-
 if not year_months:
-    month_options = [""]
-else:
-    month_options = year_months
+    st.info(
+        "Пока нет закрытых смен с заказами для формирования отчёта.\n\n"
+        "Откройте и закройте хотя бы одну смену в приложении или залейте данные через страницу Admin."
+    )
+    st.stop()
 
 ym = st.selectbox(
     "Выберите месяц",
-    month_options,
+    year_months,
     format_func=format_month_option,
 )
 
-df_shifts = get_month_shifts_details(ym if ym else None)
-totals = get_month_totals(ym if ym else None)
+df_shifts = get_month_shifts_details(ym)
+totals = get_month_totals(ym)
 
 st.write("---")
 
-# 1. Отчёт по одной смене
+# 1. ОТЧЁТ ПО ОДНОЙ СМЕНЕ
 st.subheader("📄 Отчёт по смене")
 
 if df_shifts.empty:
     st.write("Нет закрытых смен с заказами за выбранный месяц.")
-    selected_date = None
 else:
     available_dates = df_shifts["Дата"].unique().tolist()
     selected_date = st.selectbox(
@@ -493,17 +361,18 @@ else:
                 "Чаевые": "{:.0f}",
                 "Δ безнал": "{:.0f}",
                 "Км": "{:.0f}",
-                "Литры": "{:.1f}",
-                "Цена": "{:.1f}",
-                "Всего": "{:.0f}",
+                "Расход, л": "{:.1f}",
+                "Цена, ₽/л": "{:.1f}",
+                "Бензин, ₽": "{:.0f}",
+                "Чистыми, ₽": "{:.0f}",
             }
         ),
         width="stretch",
     )
 
+    shift_id = get_closed_shift_id_by_date(selected_date)
     st.markdown("**Заказы в смене**")
 
-    shift_id = get_closed_shift_id_by_date(selected_date)
     df_orders = get_shift_orders_df(shift_id)
     if df_orders.empty:
         st.write("Нет заказов для выбранной смены.")
@@ -520,16 +389,17 @@ else:
             width="stretch",
         )
 
-st.markdown("**График заказов по часам**")
-df_hours = get_orders_by_hour(selected_date if selected_date else None)
-df_hours["Час"] = df_hours["Час"].apply(lambda h: f"{h:02d}:00")
-st.bar_chart(
-    data=df_hours,
-    x="Час",
-    y="Заказов",
-)
+    st.markdown("**График заказов по часам**")
+    df_hours = get_orders_by_hour(selected_date)
+    df_hours["Час"] = df_hours["Час"].apply(lambda h: f"{h:02d}:00")
 
-# 2. Отчёт по сменам за месяц (таблица)
+    st.bar_chart(
+        data=df_hours,
+        x="Час",
+        y="Заказов",
+    )
+
+# 2. ОТЧЁТ ПО СМЕНАМ ЗА МЕСЯЦ
 st.write("---")
 st.subheader("📅 Отчёт по сменам (таблица)")
 
@@ -544,15 +414,16 @@ else:
                 "Чаевые": "{:.0f}",
                 "Δ безнал": "{:.0f}",
                 "Км": "{:.0f}",
-                "Литры": "{:.1f}",
-                "Цена": "{:.1f}",
-                "Всего": "{:.0f}",
+                "Расход, л": "{:.1f}",
+                "Цена, ₽/л": "{:.1f}",
+                "Бензин, ₽": "{:.0f}",
+                "Чистыми, ₽": "{:.0f}",
             }
         ),
         width="stretch",
     )
 
-# 3. Итоги за месяц
+# 3. ОТЧЁТ ЗА МЕСЯЦ (ИТОГИ)
 st.write("---")
 st.subheader("📊 Отчёт за месяц")
 
@@ -567,15 +438,21 @@ col5.metric("Накопленный безнал (текущий)", f"{totals['�
 col6.metric("Смен", f"{totals['смен']}")
 
 total_income = totals["всего"]
-fuel_cost = float(
-    (df_shifts["Литры"].fillna(0) * df_shifts["Цена"].fillna(0)).sum()
-) if not df_shifts.empty else 0.0
+
+if df_shifts.empty:
+    fuel_cost = 0.0
+else:
+    fuel_cost = float(df_shifts["Бензин, ₽"].fillna(0).sum())
 profit = total_income - fuel_cost
 
 st.write("---")
 st.subheader("💰 Финансовый результат за месяц")
 
-col7, col8, col9 = st.columns(3)
-col7.metric("Доход (всего)", f"{total_income:.0f} ₽")
-col8.metric("Бензин (расход)", f"{fuel_cost:.0f} ₽")
-col9.metric("Прибыль (≈)", f"{profit:.0f} ₽")
+c1, c2, c3 = st.columns(3)
+c1.metric("Доход (всего)", f"{total_income:.0f} ₽")
+c2.metric("Бензин (расход)", f"{fuel_cost:.0f} ₽")
+c3.metric("Прибыль (≈)", f"{profit:.0f} ₽")
+
+st.write(
+    "_Примечание: прибыль указана приблизительно, без учёта других возможных расходов._"
+)

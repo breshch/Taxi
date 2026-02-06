@@ -6,8 +6,8 @@ from datetime import datetime
 DB_NAME = "taxi.db"
 rate_nal = 0.78        # процент для нала (для расчёта комиссии)
 rate_card = 0.75       # процент для карты
-FUEL_PRICE = 55.0      # цена бензина за литр
-FUEL_CONSUMPTION = 8.0 # расход л/100 км
+FUEL_PRICE = 55.0      # цена бензина за литр по умолчанию
+FUEL_CONSUMPTION = 8.0 # расход л/100 км по умолчанию
 
 
 # ===== КАСТОМНЫЙ ДИЗАЙН / CSS =====
@@ -297,11 +297,15 @@ def get_shift_template():
 
 
 # ===== UI =====
-st.set_page_config(page_title="Такси учёт", page_icon="🚕", layout="centered")  # [web:811]
+st.set_page_config(page_title="Такси учёт", page_icon="🚕", layout="centered")
 apply_custom_css()
 init_db()
 
 st.title("🚕 Учёт работы такси")
+
+# версия формы заказа для «сброса» виджетов
+if "order_form_version" not in st.session_state:
+    st.session_state["order_form_version"] = 0
 
 open_shift_data = get_open_shift()
 
@@ -341,7 +345,7 @@ if not open_shift_data:
         if submitted_tpl:
             open_shift(date_input.strftime("%Y-%m-%d"))
             st.success("Смена открыта по шаблону.")
-            st.rerun()  # [web:681]
+            st.rerun()
 
     st.caption("История и отчёты — на страницах Reports / Admin в левом меню.")
 else:
@@ -354,17 +358,30 @@ else:
 
     # ===== Форма добавления заказа =====
     with st.expander("➕ Добавить заказ", expanded=True):
+        form_version = st.session_state["order_form_version"]
+
         with st.form("order_form"):
             c1, c2 = st.columns(2)
             with c1:
                 amount = st.number_input(
-                    "Сумма заказа, ₽", min_value=0.0, step=50.0, format="%.2f"
+                    "Сумма заказа, ₽",
+                    min_value=0.0,
+                    step=50.0,
+                    format="%.2f",
+                    key=f"order_amount_{form_version}",
                 )
             with c2:
-                payment = st.selectbox("Тип оплаты", ["нал", "карта"])
+                payment = st.selectbox(
+                    "Тип оплаты",
+                    ["нал", "карта"],
+                    key=f"order_payment_{form_version}",
+                )
 
             tips = st.number_input(
-                "Чаевые, ₽ (без комиссии)", min_value=0.0, step=10.0, value=0.0
+                "Чаевые, ₽ (без комиссии)",
+                min_value=0.0,
+                step=10.0,
+                key=f"order_tips_{form_version}",
             )
 
             st.caption(f"Текущее время: {datetime.now().strftime('%H:%M')}")
@@ -392,6 +409,9 @@ else:
             )
             if beznal_added != 0:
                 add_to_accumulated_beznal(beznal_added)
+
+            # увеличиваем версию формы -> новые ключи виджетов -> чистая форма
+            st.session_state["order_form_version"] += 1
 
             st.success(f"✓ Сохранено. Вам сразу: {total:.2f} ₽")
             st.rerun()
@@ -455,28 +475,45 @@ else:
 
     # ===== Закрытие смены =====
     st.write("---")
-    with st.expander("🔒 Закрыть смену (километраж)"):
+    with st.expander("🔒 Закрыть смену (километраж и бензин)"):
         with st.form("close_form"):
             km = st.number_input(
                 "Километраж за смену (км)", min_value=0, step=10
             )
+            fuel_price = st.number_input(
+                "Цена бензина, ₽/л",
+                min_value=0.0,
+                step=1.0,
+                value=FUEL_PRICE,
+            )
+            fuel_consumption = st.number_input(
+                "Расход, л на 100 км",
+                min_value=0.0,
+                step=0.5,
+                value=FUEL_CONSUMPTION,
+            )
 
-            if km > 0:
-                liters = (km / 100) * FUEL_CONSUMPTION
-                fuel_cost = liters * FUEL_PRICE
+            if km > 0 and fuel_price > 0 and fuel_consumption > 0:
+                liters = (km / 100) * fuel_consumption
+                fuel_cost = liters * fuel_price
                 st.write(
                     f"Расход: {liters:.1f} л, бензин: {fuel_cost:.2f} ₽"
                 )
             else:
+                liters = 0.0
                 fuel_cost = 0.0
 
             submitted_close = st.form_submit_button("🔒 Закрыть смену")
             if submitted_close:
-                liters = (km / 100) * FUEL_CONSUMPTION
-                fuel_cost = liters * FUEL_PRICE
-                close_shift_db(shift_id, km, liters, FUEL_PRICE)
+                if km > 0 and fuel_price > 0 and fuel_consumption > 0:
+                    liters = (km / 100) * fuel_consumption
+                else:
+                    liters = 0.0
+
+                close_shift_db(shift_id, km, liters, fuel_price)
 
                 income = nal + card + tips_sum
+                fuel_cost = liters * fuel_price
                 profit = income - fuel_cost
 
                 st.success("Смена закрыта.")
@@ -484,3 +521,4 @@ else:
                 r1.metric("Доход", f"{income:.0f} ₽")
                 r2.metric("Бензин", f"{fuel_cost:.0f} ₽")
                 r3.metric("Чистая прибыль", f"{profit:.0f} ₽")
+                st.rerun()

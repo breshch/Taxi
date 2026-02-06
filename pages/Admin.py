@@ -9,6 +9,7 @@ DB_NAME = "taxi.db"
 rate_nal = 0.78
 rate_card = 0.75
 
+
 # ===== ПРОСТАЯ АВТОРИЗАЦИЯ ДЛЯ АДМИНКИ =====
 
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "changeme")
@@ -73,6 +74,23 @@ def get_accumulated_beznal():
     row = cur.fetchone()
     conn.close()
     return row[0] if row else 0.0
+
+
+def set_accumulated_beznal(new_value: float):
+    """Установить накопленный безнал в заданное значение."""
+    conn = get_connection()
+    cur = conn.cursor()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cur.execute(
+        """
+        UPDATE accumulated_beznal
+        SET total_amount = ?, last_updated = ?
+        WHERE driver_id = 1
+        """,
+        (new_value, now),
+    )
+    conn.commit()
+    conn.close()
 
 
 def recalc_full_db():
@@ -171,6 +189,7 @@ def import_from_excel(uploaded_file) -> int:
 
         for idx, row in df_clean.iterrows():
             try:
+                # 1) Сумма
                 raw_amount = row.get("Сумма")
                 amount_f = safe_num_cell(raw_amount, default=None)
                 if amount_f is None:
@@ -180,6 +199,7 @@ def import_from_excel(uploaded_file) -> int:
                     errors += 1
                     continue
 
+                # 2) Дата
                 raw_date = row.get("Дата")
                 date_str = safe_str_cell(raw_date)
                 if not date_str:
@@ -201,6 +221,7 @@ def import_from_excel(uploaded_file) -> int:
                     )
                     shift_id = cur.lastrowid
 
+                # 4) Тип оплаты
                 raw_type = row.get("Тип", "нал")
                 raw_type_str = safe_str_cell(raw_type, default="нал").lower()
                 if raw_type_str in ("безнал", "card", "карта"):
@@ -208,9 +229,11 @@ def import_from_excel(uploaded_file) -> int:
                 else:
                     typ = "нал"
 
+                # 5) Чаевые
                 raw_tips = row.get("Чаевые")
                 tips_f = safe_num_cell(raw_tips, default=0.0)
 
+                # 6) Расчёты
                 if typ == "нал":
                     final_wo_tips = amount_f
                     commission = amount_f * (1 - rate_nal)
@@ -271,10 +294,13 @@ def import_from_excel(uploaded_file) -> int:
 
 
 def reset_db():
+    """Полный сброс базы: удаляем файл и создаём пустые таблицы + стартовую запись безнала."""
     if os.path.exists(DB_NAME):
         os.remove(DB_NAME)
+
     conn = get_connection()
     cur = conn.cursor()
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS shifts (
@@ -314,6 +340,16 @@ def reset_db():
         )
         """
     )
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cur.execute(
+        """
+        INSERT INTO accumulated_beznal (driver_id, total_amount, last_updated)
+        VALUES (1, 0, ?)
+        """,
+        (now,),
+    )
+
     conn.commit()
     conn.close()
 
@@ -471,7 +507,6 @@ with st.expander("📄 Заливка базы из Google Sheets", expanded=Fal
         "1USdDnw5OnzcIgC0mBVWGKURDJox4ncc5SAUQn-euS3Q/edit?gid=0#gid=0"
     )
     sheet_url = st.text_input("Ссылка на Google Sheets", value=default_url)
-
     if st.button("Импортировать из Google Sheets"):
         imported = import_from_gsheet(sheet_url)
         if imported > 0:
@@ -479,7 +514,9 @@ with st.expander("📄 Заливка базы из Google Sheets", expanded=Fal
 
 # 1. Импорт из файла (Excel / CSV)
 with st.expander("📂 Импорт из файла (Excel / CSV)", expanded=False):
-    uploaded_file = st.file_uploader("Выберите файл Excel или CSV", type=["xlsx", "xls", "csv"])
+    uploaded_file = st.file_uploader(
+        "Выберите файл Excel или CSV", type=["xlsx", "xls", "csv"]
+    )
     if uploaded_file is not None:
         if st.button("Импортировать из файла"):
             imported = import_from_excel(uploaded_file)
@@ -493,12 +530,34 @@ with st.expander("🔄 Пересчитать комиссии и безнал �
         st.success("Пересчёт завершён.")
         st.write(f"Текущий накопленный безнал: {get_accumulated_beznal():.0f} ₽")
 
-# 3. Сброс базы
+# 3. Ручная установка накопленного безнала
+with st.expander("💳 Установить накопленный безнал", expanded=False):
+    current = get_accumulated_beznal()
+    st.write(f"Текущий накопленный безнал: **{current:.0f} ₽**")
+
+    new_value = st.number_input(
+        "Новое значение накопленного безнала (₽)",
+        step=100.0,
+        value=float(current),
+    )
+
+    if st.button("Сохранить новое значение"):
+        set_accumulated_beznal(new_value)
+        st.success(f"Накопленный безнал обновлён: {new_value:.0f} ₽")
+        st.rerun()
+
+# 4. Сброс базы
 with st.expander("⚠️ Полный сброс базы", expanded=False):
     st.warning(
         "Эта операция удалит все смены и заказы и создаст пустую базу заново. "
         "Используйте только если точно понимаете, что делаете."
     )
+    confirm = st.text_input(
+        "Для подтверждения введите СБРОС (заглавными буквами)", value=""
+    )
     if st.button("Удалить базу и создать заново"):
-        reset_db()
-        st.success("База сброшена и создана заново.")
+        if confirm.strip() == "СБРОС":
+            reset_db()
+            st.success("База сброшена и создана заново.")
+        else:
+            st.error("Нужно ввести СБРОС для подтверждения.")

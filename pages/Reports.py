@@ -2,6 +2,7 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 
+
 DB_NAME = "taxi.db"
 
 
@@ -213,10 +214,17 @@ def get_shift_orders_df(shift_id: int | None) -> pd.DataFrame:
 
     data = []
     for typ, amount, tips, beznal_added, total, order_time in rows:
+        if typ == "нал":
+            payment_type = "Нал"
+        elif typ == "карта":
+            payment_type = "Карта"
+        else:
+            payment_type = str(typ or "")
+
         data.append(
             {
                 "Время": order_time or "",
-                "Тип": "Нал" if typ == "нал" else "Карта",
+                "Тип": payment_type,
                 "Сумма": amount or 0.0,
                 "Чаевые": tips or 0.0,
                 "Δ безнал": beznal_added or 0.0,
@@ -258,9 +266,11 @@ def get_orders_by_hour(date_str: str) -> pd.DataFrame:
     hours = []
     for t in times:
         try:
-            h = int(str(t)[0:2])
-            if 0 <= h <= 23:
-                hours.append(h)
+            s = str(t).strip()
+            if len(s) >= 2 and s[:2].isdigit():
+                h = int(s[:2])
+                if 0 <= h <= 23:
+                    hours.append(h)
         except Exception:
             continue
 
@@ -387,7 +397,7 @@ else:
         data=df_hours,
         x="Час",
         y="Заказов",
-    )  # [web:823]
+    )
 
 # 2. ОТЧЁТ ПО СМЕНАМ ЗА МЕСЯЦ
 st.write("---")
@@ -425,5 +435,16 @@ col4, col5, col6 = st.columns(3)
 col4.metric("Изм. безнала (за месяц)", f"{totals['безнал_добавлено']:.0f} ₽")
 col5.metric("Накопленный безнал (текущий)", f"{totals['накопленный_безнал']:.0f} ₽")
 col6.metric("Смен", f"{totals['смен']}")
+
+# Подсчёт дохода, затрат на бензин и примерной прибыли
 total_income = totals["всего"]
-fuel_cost = 0.0 # Здесь можно добавить логику подсчёта затрат на бензин, если нужно 
+fuel_cost = float((df_shifts["Литры"].fillna(0) * df_shifts["Цена"].fillna(0)).sum())
+profit = total_income - fuel_cost
+
+st.write("---")
+st.subheader("💰 Финансовый результат за месяц")
+
+col7, col8, col9 = st.columns(3)
+col7.metric("Доход (всего)", f"{total_income:.0f} ₽")
+col8.metric("Бензин (расход)", f"{fuel_cost:.0f} ₽")
+col9.metric("Прибыль (≈)", f"{profit:.0f} ₽")

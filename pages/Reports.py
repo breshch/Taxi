@@ -306,10 +306,18 @@ def get_orders_by_hour(date_str: str) -> pd.DataFrame:
 
 
 def format_month_option(s) -> str:
-    """Возвращаем месяц как есть, без добавления названий."""
+    """Отображаем месяц как MM.YYYY вместо YYYY-MM."""
     if s is None:
         return "—"
-    return str(s)
+    s_str = str(s).strip()
+    # ожидаем строку вида YYYY-MM
+    try:
+        dt = pd.to_datetime(s_str + "-01", format="%Y-%m-%d", errors="raise")
+        return dt.strftime("%m.%Y")
+    except Exception:
+        # если формат необычный, показываем как есть
+        return s_str or "—"
+
 
 
 # ===== UI =====

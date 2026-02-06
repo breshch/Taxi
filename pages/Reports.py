@@ -12,7 +12,9 @@ def get_connection():
 
 def get_available_year_months():
     """
-    Месяцы только по закрытым сменам, у которых есть хотя бы один заказ.
+    Месяцы по всем сменам (и открытым, и закрытым).
+    Если в базе совсем нет смен, возвращаем текущий месяц,
+    чтобы отчёты всегда открывались.
     """
     conn = get_connection()
     cur = conn.cursor()
@@ -22,8 +24,6 @@ def get_available_year_months():
         FROM shifts
         WHERE date IS NOT NULL
           AND TRIM(date) <> ''
-          AND is_open = 0
-          AND EXISTS (SELECT 1 FROM orders o WHERE o.shift_id = shifts.id)
         ORDER BY 1 DESC
         """
     )
@@ -37,6 +37,12 @@ def get_available_year_months():
         s = str(val)
         if len(s) >= 7 and s[0:4].isdigit() and s[5:7].isdigit():
             res.append(s)
+
+    # если смен нет вообще — показываем текущий год-месяц
+    if not res:
+        today = pd.Timestamp.today()
+        res = [today.strftime("%Y-%m")]
+
     return res
 
 
@@ -53,7 +59,8 @@ def get_current_accumulated_beznal() -> float:
 
 def get_month_totals(year_month: str):
     """
-    Итоги за месяц по ЗАКРЫТЫМ сменам, где есть хотя бы один заказ.
+    Итоги за месяц по всем сменам (и открытым, и закрытым),
+    учитываются все заказы, если они есть.
     """
     conn = get_connection()
     cur = conn.cursor()
@@ -63,8 +70,6 @@ def get_month_totals(year_month: str):
         SELECT id
         FROM shifts
         WHERE date LIKE ?
-          AND is_open = 0
-          AND EXISTS (SELECT 1 FROM orders o WHERE o.shift_id = shifts.id)
         """,
         (f"{year_month}%",),
     )
@@ -93,7 +98,11 @@ def get_month_totals(year_month: str):
             "FROM orders WHERE shift_id = ?",
             (shift_id,),
         )
-        tips_sum, beznal_sum = cur.fetchone()
+        row = cur.fetchone()
+        if row:
+            tips_sum, beznal_sum = row
+        else:
+            tips_sum, beznal_sum = (0.0, 0.0)
         total_tips += tips_sum or 0.0
         total_beznal_add += beznal_sum or 0.0
 
@@ -114,8 +123,9 @@ def get_month_totals(year_month: str):
 
 def get_month_shifts_details(year_month: str) -> pd.DataFrame:
     """
-    Одна строка на каждую ЗАКРЫТУЮ смену, у которой есть хотя бы один заказ.
-    Км/расход/цена берутся только из закрытия смены.
+    Одна строка на каждую смену (и открытую, и закрытую) за месяц.
+    Км/расход/цена берутся из записи смены; если смена ещё не закрыта,
+    эти поля могут быть 0.
     """
     conn = get_connection()
     cur = conn.cursor()
@@ -125,8 +135,6 @@ def get_month_shifts_details(year_month: str) -> pd.DataFrame:
         SELECT id, date, km, fuel_liters, fuel_price
         FROM shifts
         WHERE date LIKE ?
-          AND is_open = 0
-          AND EXISTS (SELECT 1 FROM orders o WHERE o.shift_id = shifts.id)
         ORDER BY date
         """,
         (f"{year_month}%",),
@@ -148,7 +156,11 @@ def get_month_shifts_details(year_month: str) -> pd.DataFrame:
             "FROM orders WHERE shift_id = ?",
             (shift_id,),
         )
-        tips_sum, beznal_sum = cur.fetchone()
+        row = cur.fetchone()
+        if row:
+            tips_sum, beznal_sum = row
+        else:
+            tips_sum, beznal_sum = (0.0, 0.0)
         tips_sum = tips_sum or 0.0
         beznal_sum = beznal_sum or 0.0
 
@@ -185,11 +197,14 @@ def get_month_shifts_details(year_month: str) -> pd.DataFrame:
 
 
 def get_closed_shift_id_by_date(date_str: str):
-    """id ЗАКРЫТОЙ смены по дате."""
+    """
+    id смены по дате (берём первую по id, не важно, открыта она или закрыта),
+    чтобы отчёт мог работать и по незакрытой смене.
+    """
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "SELECT id FROM shifts WHERE date = ? AND is_open = 0 ORDER BY id LIMIT 1",
+        "SELECT id FROM shifts WHERE date = ? ORDER BY id LIMIT 1",
         (date_str,),
     )
     row = cur.fetchone()
@@ -239,7 +254,7 @@ def get_shift_orders_df(shift_id: int | None) -> pd.DataFrame:
 
 def get_orders_by_hour(date_str: str) -> pd.DataFrame:
     """
-    Кол-во заказов по часам за дату.
+    Кол-во заказов по часам за дату (по всем сменам за день).
     """
     conn = get_connection()
     cur = conn.cursor()
@@ -249,7 +264,6 @@ def get_orders_by_hour(date_str: str) -> pd.DataFrame:
         FROM orders o
         JOIN shifts s ON o.shift_id = s.id
         WHERE s.date = ?
-          AND s.is_open = 0
           AND o.order_time IS NOT NULL
         """,
         (date_str,),
@@ -319,13 +333,6 @@ st.title("📊 Отчёты")
 
 year_months = get_available_year_months()
 
-if not year_months:
-    st.info(
-        "Пока нет закрытых смен с заказами для формирования отчёта.\n\n"
-        "Откройте и закройте хотя бы одну смену в приложении или залейте данные через страницу Admin."
-    )
-    st.stop()
-
 ym = st.selectbox(
     "Выберите месяц",
     year_months,
@@ -341,7 +348,7 @@ st.write("---")
 st.subheader("📄 Отчёт по смене")
 
 if df_shifts.empty:
-    st.write("Нет закрытых смен с заказами за выбранный месяц.")
+    st.write("Пока нет смен за выбранный месяц.")
 else:
     available_dates = df_shifts["Дата"].unique().tolist()
     selected_date = st.selectbox(

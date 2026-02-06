@@ -4,14 +4,12 @@ from datetime import datetime
 import pandas as pd
 import os
 
-
 DB_NAME = "taxi.db"
+
 rate_nal = 0.78
 rate_card = 0.75
 
-
 # ===== ПРОСТАЯ АВТОРИЗАЦИЯ ДЛЯ АДМИНКИ =====
-
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "5484")
 
 
@@ -24,7 +22,6 @@ def check_admin_auth() -> bool:
         return True
 
     st.subheader("🔐 Вход в режим администрирования")
-
     with st.form("admin_login"):
         pwd = st.text_input("Пароль администратора", type="password")
         ok = st.form_submit_button("Войти")
@@ -36,17 +33,17 @@ def check_admin_auth() -> bool:
             return True
         else:
             st.error("Неверный пароль.")
+            return False
 
     return False
 
 
 # ===== БАЗА / ХЕЛПЕРЫ =====
-
 def get_connection():
     return sqlite3.connect(DB_NAME)
 
 
-def safe_str_cell(v, default=""):
+def safe_str_cell(v, default: str = "") -> str:
     """Строка из ячейки: пустые/NaN -> default."""
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return default
@@ -54,8 +51,8 @@ def safe_str_cell(v, default=""):
     return s if s != "" else default
 
 
-def safe_num_cell(v, default=0.0):
-    """Число из ячейки: пустые/NaN/мусор -> default."""
+def safe_num_cell(v, default: float = 0.0) -> float | None:
+    """Число из ячейки: пустые/NaN/мусор -> default (или None)."""
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return default
     s = str(v).strip().replace(",", ".")
@@ -76,24 +73,8 @@ def get_accumulated_beznal():
     return row[0] if row else 0.0
 
 
-def set_accumulated_beznal(new_value: float):
-    """Установить накопленный безнал в заданное значение."""
-    conn = get_connection()
-    cur = conn.cursor()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cur.execute(
-        """
-        UPDATE accumulated_beznal
-        SET total_amount = ?, last_updated = ?
-        WHERE driver_id = 1
-        """,
-        (new_value, now),
-    )
-    conn.commit()
-    conn.close()
-
-
 def recalc_full_db():
+    """Пересчитать комиссию, total и безнал по всем заказам и обновить accumulated_beznal."""
     conn = get_connection()
     cur = conn.cursor()
 
@@ -124,6 +105,7 @@ def recalc_full_db():
             (commission, total, beznal_added, order_id),
         )
 
+    # пересчёт накопленного безнала
     cur.execute("SELECT COALESCE(SUM(beznal_added), 0) FROM orders")
     total_beznal = cur.fetchone()[0] or 0.0
 
@@ -156,8 +138,8 @@ def recalc_full_db():
 def import_from_excel(uploaded_file) -> int:
     """
     Импорт из Excel/CSV.
-
     Строка без суммы или без даты не создаёт смену.
+    Даты нормализуются в YYYY-MM-DD.
     """
     try:
         if uploaded_file.name.lower().endswith(".csv"):
@@ -184,12 +166,12 @@ def import_from_excel(uploaded_file) -> int:
 
         imported = 0
         errors = 0
+
         conn = get_connection()
         cur = conn.cursor()
 
         for idx, row in df_clean.iterrows():
             try:
-                # 1) Сумма
                 raw_amount = row.get("Сумма")
                 amount_f = safe_num_cell(raw_amount, default=None)
                 if amount_f is None:
@@ -199,15 +181,25 @@ def import_from_excel(uploaded_file) -> int:
                     errors += 1
                     continue
 
-                # 2) Дата
                 raw_date = row.get("Дата")
-                date_str = safe_str_cell(raw_date)
-                if not date_str:
+                date_raw = safe_str_cell(raw_date)
+                if not date_raw:
                     st.warning(
                         f"❌ Строка {idx}: пустая дата при сумме {amount_f}, пропускаю."
                     )
                     errors += 1
                     continue
+
+                # нормализация даты
+                dt = pd.to_datetime(date_raw, dayfirst=True, errors="coerce")
+                if pd.isna(dt):
+                    st.warning(
+                        f"❌ Строка {idx}: не удалось разобрать дату {date_raw!r}, пропускаю."
+                    )
+                    errors += 1
+                    continue
+
+                date_str = dt.strftime("%Y-%m-%d")
 
                 cur.execute("SELECT id FROM shifts WHERE date = ?", (date_str,))
                 s = cur.fetchone()
@@ -221,7 +213,6 @@ def import_from_excel(uploaded_file) -> int:
                     )
                     shift_id = cur.lastrowid
 
-                # 4) Тип оплаты
                 raw_type = row.get("Тип", "нал")
                 raw_type_str = safe_str_cell(raw_type, default="нал").lower()
                 if raw_type_str in ("безнал", "card", "карта"):
@@ -229,11 +220,9 @@ def import_from_excel(uploaded_file) -> int:
                 else:
                     typ = "нал"
 
-                # 5) Чаевые
                 raw_tips = row.get("Чаевые")
                 tips_f = safe_num_cell(raw_tips, default=0.0)
 
-                # 6) Расчёты
                 if typ == "нал":
                     final_wo_tips = amount_f
                     commission = amount_f * (1 - rate_nal)
@@ -273,7 +262,6 @@ def import_from_excel(uploaded_file) -> int:
                     )
 
                 imported += 1
-
             except Exception as e:
                 st.warning(f"⚠️ Строка {idx}: {e}")
                 errors += 1
@@ -284,8 +272,8 @@ def import_from_excel(uploaded_file) -> int:
 
         if imported > 0:
             st.success(f"✅ Импортировано: {imported} заказов")
-            if errors > 0:
-                st.warning(f"⚠️ Ошибок при импорте: {errors}")
+        if errors > 0:
+            st.warning(f"⚠️ Ошибок при импорте: {errors}")
         return imported
 
     except Exception as e:
@@ -294,7 +282,7 @@ def import_from_excel(uploaded_file) -> int:
 
 
 def reset_db():
-    """Полный сброс базы: удаляем файл и создаём пустые таблицы + стартовую запись безнала."""
+    """Полный сброс базы и создание пустых таблиц."""
     if os.path.exists(DB_NAME):
         os.remove(DB_NAME)
 
@@ -315,6 +303,7 @@ def reset_db():
         )
         """
     )
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS orders (
@@ -330,6 +319,7 @@ def reset_db():
         )
         """
     )
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS accumulated_beznal (
@@ -341,15 +331,6 @@ def reset_db():
         """
     )
 
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cur.execute(
-        """
-        INSERT INTO accumulated_beznal (driver_id, total_amount, last_updated)
-        VALUES (1, 0, ?)
-        """,
-        (now,),
-    )
-
     conn.commit()
     conn.close()
 
@@ -357,8 +338,8 @@ def reset_db():
 def import_from_gsheet(sheet_url: str) -> int:
     """
     Импортирует заказы из Google Sheets.
-
     Пустые даты или строки без суммы не создают смену.
+    Даты нормализуются в YYYY-MM-DD.
     """
     try:
         base_url = sheet_url.split("#")[0]
@@ -387,6 +368,7 @@ def import_from_gsheet(sheet_url: str) -> int:
 
     imported = 0
     errors = 0
+
     conn = get_connection()
     cur = conn.cursor()
 
@@ -402,13 +384,24 @@ def import_from_gsheet(sheet_url: str) -> int:
                 continue
 
             raw_date = row.get("Дата")
-            date_str = safe_str_cell(raw_date)
-            if not date_str:
+            date_raw = safe_str_cell(raw_date)
+            if not date_raw:
                 st.warning(
                     f"❌ Строка {idx}: пустая дата при сумме {amount_f}, пропускаю."
                 )
                 errors += 1
                 continue
+
+            # нормализация даты из Google Sheets
+            dt = pd.to_datetime(date_raw, dayfirst=True, errors="coerce")
+            if pd.isna(dt):
+                st.warning(
+                    f"❌ Строка {idx}: не удалось разобрать дату {date_raw!r}, пропускаю."
+                )
+                errors += 1
+                continue
+
+            date_str = dt.strftime("%Y-%m-%d")
 
             cur.execute("SELECT id FROM shifts WHERE date = ?", (date_str,))
             s = cur.fetchone()
@@ -471,7 +464,6 @@ def import_from_gsheet(sheet_url: str) -> int:
                 )
 
             imported += 1
-
         except Exception as e:
             st.warning(f"⚠️ Строка {idx}: {e}")
             errors += 1
@@ -482,13 +474,12 @@ def import_from_gsheet(sheet_url: str) -> int:
 
     if imported > 0:
         st.success(f"✅ Импортировано из Google Sheets: {imported} заказов")
-        if errors > 0:
-            st.warning(f"⚠️ Ошибок при импорте: {errors}")
+    if errors > 0:
+        st.warning(f"⚠️ Ошибок при импорте: {errors}")
     return imported
 
 
 # ===== UI / ЗАПУСК СТРАНИЦЫ =====
-
 st.set_page_config(page_title="Администрирование", page_icon="🛠", layout="centered")
 st.title("🛠 Администрирование")
 
@@ -506,7 +497,9 @@ with st.expander("📄 Заливка базы из Google Sheets", expanded=Fal
         "https://docs.google.com/spreadsheets/d/"
         "1USdDnw5OnzcIgC0mBVWGKURDJox4ncc5SAUQn-euS3Q/edit?gid=0#gid=0"
     )
+
     sheet_url = st.text_input("Ссылка на Google Sheets", value=default_url)
+
     if st.button("Импортировать из Google Sheets"):
         imported = import_from_gsheet(sheet_url)
         if imported > 0:
@@ -528,36 +521,14 @@ with st.expander("🔄 Пересчитать комиссии и безнал �
     if st.button("Пересчитать всё"):
         recalc_full_db()
         st.success("Пересчёт завершён.")
-        st.write(f"Текущий накопленный безнал: {get_accumulated_beznal():.0f} ₽")
+    st.write(f"Текущий накопленный безнал: {get_accumulated_beznal():.0f} ₽")
 
-# 3. Ручная установка накопленного безнала
-with st.expander("💳 Установить накопленный безнал", expanded=False):
-    current = get_accumulated_beznal()
-    st.write(f"Текущий накопленный безнал: **{current:.0f} ₽**")
-
-    new_value = st.number_input(
-        "Новое значение накопленного безнала (₽)",
-        step=100.0,
-        value=float(current),
-    )
-
-    if st.button("Сохранить новое значение"):
-        set_accumulated_beznal(new_value)
-        st.success(f"Накопленный безнал обновлён: {new_value:.0f} ₽")
-        st.rerun()
-
-# 4. Сброс базы
+# 3. Сброс базы
 with st.expander("⚠️ Полный сброс базы", expanded=False):
     st.warning(
         "Эта операция удалит все смены и заказы и создаст пустую базу заново. "
         "Используйте только если точно понимаете, что делаете."
     )
-    confirm = st.text_input(
-        "Для подтверждения введите СБРОС (заглавными буквами)", value=""
-    )
     if st.button("Удалить базу и создать заново"):
-        if confirm.strip() == "СБРОС":
-            reset_db()
-            st.success("База сброшена и создана заново.")
-        else:
-            st.error("Нужно ввести СБРОС для подтверждения.")
+        reset_db()
+        st.success("База сброшена и создана заново.")

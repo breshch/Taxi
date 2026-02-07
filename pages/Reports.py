@@ -1,9 +1,9 @@
 import streamlit as st
 import sqlite3
 import pandas as pd
+from datetime import datetime
 
 DB_NAME = "taxi.db"
-
 
 # ===== Работа с БД =====
 def get_connection():
@@ -12,44 +12,32 @@ def get_connection():
 
 def get_available_year_months():
     """
-    Список месяцев по всем сменам.
-    Даты парсим в Python, чтобы учесть любые форматы (в т.ч. старые типа 20.01.26).
-    Если смен нет или все даты битые, возвращаем текущий месяц.
+    Месяцы только по закрытым сменам, у которых есть хотя бы один заказ.
+    Формат: 'YYYY-MM'.
     """
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT DISTINCT date
+        SELECT DISTINCT strftime('%Y-%m', date)
         FROM shifts
         WHERE date IS NOT NULL
           AND TRIM(date) <> ''
+          AND is_open = 0
+          AND EXISTS (SELECT 1 FROM orders o WHERE o.shift_id = shifts.id)
+        ORDER BY 1 DESC
         """
     )
     rows = cur.fetchall()
     conn.close()
 
-    months = set()
-
-    for (date_val,) in rows:
-        if date_val is None:
+    res = []
+    for (val,) in rows:
+        if val is None:
             continue
-        s = str(date_val).strip()
-        if not s:
-            continue
-
-        dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
-        if pd.isna(dt):
-            continue
-
-        ym = dt.strftime("%Y-%m")
-        months.add(ym)
-
-    if not months:
-        today = pd.Timestamp.today()
-        months = {today.strftime("%Y-%m")}
-
-    res = sorted(months, reverse=True)
+        s = str(val)
+        if len(s) >= 7 and s[0:4].isdigit() and s[5:7].isdigit():
+            res.append(s)
     return res
 
 
@@ -66,8 +54,8 @@ def get_current_accumulated_beznal() -> float:
 
 def get_month_totals(year_month: str):
     """
-    Итоги за месяц по всем сменам (и открытым, и закрытым),
-    учитываются все заказы, если они есть.
+    Итоги за месяц по ЗАКРЫТЫМ сменам, где есть хотя бы один заказ.
+    year_month в формате 'YYYY-MM'.
     """
     conn = get_connection()
     cur = conn.cursor()
@@ -77,6 +65,8 @@ def get_month_totals(year_month: str):
         SELECT id
         FROM shifts
         WHERE date LIKE ?
+          AND is_open = 0
+          AND EXISTS (SELECT 1 FROM orders o WHERE o.shift_id = shifts.id)
         """,
         (f"{year_month}%",),
     )
@@ -105,16 +95,11 @@ def get_month_totals(year_month: str):
             "FROM orders WHERE shift_id = ?",
             (shift_id,),
         )
-        row = cur.fetchone()
-        if row:
-            tips_sum, beznal_sum = row
-        else:
-            tips_sum, beznal_sum = (0.0, 0.0)
+        tips_sum, beznal_sum = cur.fetchone()
         total_tips += tips_sum or 0.0
         total_beznal_add += beznal_sum or 0.0
 
     conn.close()
-
     current_acc = get_current_accumulated_beznal()
 
     return {
@@ -130,9 +115,8 @@ def get_month_totals(year_month: str):
 
 def get_month_shifts_details(year_month: str) -> pd.DataFrame:
     """
-    Одна строка на каждую смену (и открытую, и закрытую) за месяц.
-    Км/расход/цена берутся из записи смены; если смена ещё не закрыта,
-    эти поля могут быть 0.
+    Одна строка на каждую ЗАКРЫТУЮ смену, у которой есть хотя бы один заказ.
+    Км/литры/цена берутся только из закрытия смены.
     """
     conn = get_connection()
     cur = conn.cursor()
@@ -142,6 +126,8 @@ def get_month_shifts_details(year_month: str) -> pd.DataFrame:
         SELECT id, date, km, fuel_liters, fuel_price
         FROM shifts
         WHERE date LIKE ?
+          AND is_open = 0
+          AND EXISTS (SELECT 1 FROM orders o WHERE o.shift_id = shifts.id)
         ORDER BY date
         """,
         (f"{year_month}%",),
@@ -149,7 +135,6 @@ def get_month_shifts_details(year_month: str) -> pd.DataFrame:
     shifts = cur.fetchall()
 
     rows = []
-
     for shift_id, date_str, km, fuel_liters, fuel_price in shifts:
         cur.execute(
             "SELECT type, SUM(total - tips) "
@@ -163,36 +148,25 @@ def get_month_shifts_details(year_month: str) -> pd.DataFrame:
             "FROM orders WHERE shift_id = ?",
             (shift_id,),
         )
-        row = cur.fetchone()
-        if row:
-            tips_sum, beznal_sum = row
-        else:
-            tips_sum, beznal_sum = (0.0, 0.0)
+        tips_sum, beznal_sum = cur.fetchone()
         tips_sum = tips_sum or 0.0
         beznal_sum = beznal_sum or 0.0
 
         nal = by_type.get("нал", 0.0) or 0.0
         card = by_type.get("карта", 0.0) or 0.0
-
-        liters = fuel_liters or 0.0
-        price = fuel_price or 0.0
-        fuel_cost = liters * price
-
-        income = nal + card + tips_sum
-        net = income - fuel_cost
+        total = nal + card + tips_sum
 
         rows.append(
             {
-                "Дата": date_str,  # сырая дата из БД
+                "Дата": date_str,
                 "Нал": nal,
                 "Карта": card,
                 "Чаевые": tips_sum,
                 "Δ безнал": beznal_sum,
                 "Км": km or 0,
-                "Расход, л": liters,
-                "Цена, ₽/л": price,
-                "Бензин, ₽": fuel_cost,
-                "Чистыми, ₽": net,
+                "Литры": fuel_liters or 0.0,
+                "Цена": fuel_price or 0.0,
+                "Всего": total,
             }
         )
 
@@ -204,14 +178,11 @@ def get_month_shifts_details(year_month: str) -> pd.DataFrame:
 
 
 def get_closed_shift_id_by_date(date_str: str):
-    """
-    id смены по дате (берём первую по id, не важно, открыта она или закрыта),
-    чтобы отчёт мог работать и по незакрытой смене.
-    """
+    """id ЗАКРЫТОЙ смены по дате (date_str формата YYYY-MM-DD)."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "SELECT id FROM shifts WHERE date = ? ORDER BY id LIMIT 1",
+        "SELECT id FROM shifts WHERE date = ? AND is_open = 0 ORDER BY id LIMIT 1",
         (date_str,),
     )
     row = cur.fetchone()
@@ -220,9 +191,7 @@ def get_closed_shift_id_by_date(date_str: str):
 
 
 def get_shift_orders_df(shift_id: int | None) -> pd.DataFrame:
-    """
-    Заказы в смене: одна строка = один заказ.
-    """
+    """Заказы в смене: одна строка = один заказ."""
     if shift_id is None:
         return pd.DataFrame()
 
@@ -261,7 +230,7 @@ def get_shift_orders_df(shift_id: int | None) -> pd.DataFrame:
 
 def get_orders_by_hour(date_str: str) -> pd.DataFrame:
     """
-    Кол-во заказов по часам за дату (по всем сменам за день).
+    Кол-во заказов по часам за дату (date_str формата YYYY-MM-DD).
     """
     conn = get_connection()
     cur = conn.cursor()
@@ -271,6 +240,7 @@ def get_orders_by_hour(date_str: str) -> pd.DataFrame:
         FROM orders o
         JOIN shifts s ON o.shift_id = s.id
         WHERE s.date = ?
+          AND s.is_open = 0
           AND o.order_time IS NOT NULL
         """,
         (date_str,),
@@ -279,7 +249,6 @@ def get_orders_by_hour(date_str: str) -> pd.DataFrame:
     conn.close()
 
     times = [r[0] for r in rows]
-
     if not times:
         return pd.DataFrame({"Час": list(range(24)), "Заказов": [0] * 24})
 
@@ -297,24 +266,50 @@ def get_orders_by_hour(date_str: str) -> pd.DataFrame:
 
     s = pd.Series(hours)
     counts = s.value_counts().sort_index()
-
     df = pd.DataFrame({"Час": counts.index, "Заказов": counts.values})
     full = pd.DataFrame({"Час": list(range(24))})
     df = full.merge(df, on="Час", how="left").fillna(0)
     df["Заказов"] = df["Заказов"].astype(int)
+
     return df
 
 
+# ===== Справочники =====
+month_name = {
+    1: "январь",
+    2: "февраль",
+    3: "март",
+    4: "апрель",
+    5: "май",
+    6: "июнь",
+    7: "июль",
+    8: "август",
+    9: "сентябрь",
+    10: "октябрь",
+    11: "ноябрь",
+    12: "декабрь",
+}
+
+
 def format_month_option(s) -> str:
-    """В селекте показываем месяц как MM.YYYY вместо YYYY-MM."""
+    """Показывает 'YYYY-MM (месяц)'."""
     if s is None:
         return "—"
-    s_str = str(s).strip()
+    s_str = str(s)
+    if len(s_str) >= 7:
+        mm = s_str[5:7]
+        if mm.isdigit():
+            m = int(mm)
+            return f"{s_str} ({month_name.get(m, '')})"
+    return s_str or "—"
+
+
+def format_date_ddmmyyyy(s: str) -> str:
+    """Форматирует YYYY-MM-DD -> DD.MM.YYYY для отображения."""
     try:
-        dt = pd.to_datetime(s_str + "-01", format="%Y-%m-%d", errors="raise")
-        return dt.strftime("%m.%Y")
+        return datetime.strptime(s, "%Y-%m-%d").strftime("%d.%m.%Y")
     except Exception:
-        return s_str or "—"
+        return s or "—"
 
 
 # ===== UI =====
@@ -322,6 +317,10 @@ st.set_page_config(page_title="Отчёты", page_icon="📊", layout="centered
 st.title("📊 Отчёты")
 
 year_months = get_available_year_months()
+
+if not year_months:
+    st.info("Пока нет закрытых смен с заказами для формирования отчёта.")
+    st.stop()
 
 ym = st.selectbox(
     "Выберите месяц",
@@ -338,46 +337,36 @@ st.write("---")
 st.subheader("📄 Отчёт по смене")
 
 if df_shifts.empty:
-    st.write("Пока нет смен за выбранный месяц.")
+    st.write("Нет закрытых смен с заказами за выбранный месяц.")
 else:
-    # выбор даты по сырому значению из БД
     available_dates = df_shifts["Дата"].unique().tolist()
     selected_date = st.selectbox(
         "Дата смены",
         options=available_dates,
+        format_func=format_date_ddmmyyyy,
     )
 
     df_shift_summary = df_shifts[df_shifts["Дата"] == selected_date].copy()
-
-    # отдельный датафрейм только для отображения: форматируем дату как дд.мм.гггг
-    df_shift_display = df_shift_summary.copy()
-    dt_series = pd.to_datetime(df_shift_display["Дата"], dayfirst=True, errors="coerce")
-    mask = dt_series.notna()
-    df_shift_display.loc[mask, "Дата"] = dt_series[mask].dt.strftime("%d.%m.%Y")
-
-    if not df_shift_display.empty:
-        df_shift_display.index = list(range(1, len(df_shift_display) + 1))
-
-    st.dataframe(
-        df_shift_display.style.format(
-            {
-                "Нал": "{:.0f}",
-                "Карта": "{:.0f}",
-                "Чаевые": "{:.0f}",
-                "Δ безнал": "{:.0f}",
-                "Км": "{:.0f}",
-                "Расход, л": "{:.1f}",
-                "Цена, ₽/л": "{:.1f}",
-                "Бензин, ₽": "{:.0f}",
-                "Чистыми, ₽": "{:.0f}",
-            }
-        ),
-        width="stretch",
-    )
+    if not df_shift_summary.empty:
+        df_shift_summary.index = list(range(1, len(df_shift_summary) + 1))
+        st.dataframe(
+            df_shift_summary.style.format(
+                {
+                    "Нал": "{:.0f}",
+                    "Карта": "{:.0f}",
+                    "Чаевые": "{:.0f}",
+                    "Δ безнал": "{:.0f}",
+                    "Км": "{:.0f}",
+                    "Литры": "{:.1f}",
+                    "Цена": "{:.1f}",
+                    "Всего": "{:.0f}",
+                }
+            ),
+            width="stretch",
+        )
 
     shift_id = get_closed_shift_id_by_date(selected_date)
     st.markdown("**Заказы в смене**")
-
     df_orders = get_shift_orders_df(shift_id)
     if df_orders.empty:
         st.write("Нет заказов для выбранной смены.")
@@ -397,7 +386,6 @@ else:
     st.markdown("**График заказов по часам**")
     df_hours = get_orders_by_hour(selected_date)
     df_hours["Час"] = df_hours["Час"].apply(lambda h: f"{h:02d}:00")
-
     st.bar_chart(
         data=df_hours,
         x="Час",
@@ -411,27 +399,17 @@ st.subheader("📅 Отчёт по сменам (таблица)")
 if df_shifts.empty:
     st.write("Нет детальных данных по сменам за выбранный месяц.")
 else:
-    df_shifts_display = df_shifts.copy()
-    dt_series_all = pd.to_datetime(
-        df_shifts_display["Дата"], dayfirst=True, errors="coerce"
-    )
-    mask_all = dt_series_all.notna()
-    df_shifts_display.loc[mask_all, "Дата"] = dt_series_all[mask_all].dt.strftime(
-        "%d.%m.%Y"
-    )
-
     st.dataframe(
-        df_shifts_display.style.format(
+        df_shifts.style.format(
             {
                 "Нал": "{:.0f}",
                 "Карта": "{:.0f}",
                 "Чаевые": "{:.0f}",
                 "Δ безнал": "{:.0f}",
                 "Км": "{:.0f}",
-                "Расход, л": "{:.1f}",
-                "Цена, ₽/л": "{:.1f}",
-                "Бензин, ₽": "{:.0f}",
-                "Чистыми, ₽": "{:.0f}",
+                "Литры": "{:.1f}",
+                "Цена": "{:.1f}",
+                "Всего": "{:.0f}",
             }
         ),
         width="stretch",
@@ -453,10 +431,14 @@ col6.metric("Смен", f"{totals['смен']}")
 
 total_income = totals["всего"]
 
+# Расходы на бензин и примерная прибыль за месяц
 if df_shifts.empty:
     fuel_cost = 0.0
 else:
-    fuel_cost = float(df_shifts["Бензин, ₽"].fillna(0).sum())
+    fuel_cost = float(
+        (df_shifts["Литры"].fillna(0) * df_shifts["Цена"].fillna(0)).sum()
+    )
+
 profit = total_income - fuel_cost
 
 st.write("---")
@@ -470,3 +452,4 @@ c3.metric("Прибыль (≈)", f"{profit:.0f} ₽")
 st.write(
     "_Примечание: прибыль указана приблизительно, без учёта других возможных расходов._"
 )
+st.write("---")     

@@ -79,6 +79,48 @@ def safe_num_cell(v, default=0.0):
         return default
 
 
+def parse_date_to_iso(v) -> str | None:
+    """
+    Универсальный парсер даты:
+    возвращает строку YYYY-MM-DD или None, если распарсить не удалось.
+    """
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+
+    from datetime import date as _date, datetime as _dt
+
+    # Уже datetime/дата/Timestamp
+    if isinstance(v, (_dt, _date, pd.Timestamp)):
+        dt = pd.to_datetime(v).date()
+        return dt.strftime("%Y-%m-%d")
+
+    s = str(v).strip()
+    if not s:
+        return None
+
+    # Попытки явных форматов
+    fmts = [
+        "%Y-%m-%d",
+        "%d.%m.%Y",
+        "%d-%m-%Y",
+        "%d/%m/%Y",
+        "%Y/%m/%d",
+        "%Y.%m.%d",
+    ]
+    for fmt in fmts:
+        try:
+            dt = _dt.strptime(s, fmt)
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+
+    # Последняя попытка через pandas
+    dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
+    if pd.isna(dt):
+        return None
+    return dt.date().strftime("%Y-%m-%d")
+
+
 def get_accumulated_beznal():
     conn = get_connection()
     cur = conn.cursor()
@@ -197,27 +239,15 @@ def import_from_excel(uploaded_file) -> int:
                     errors += 1
                     continue
 
-                raw_date = row.get("Дата")
-                date_raw = safe_str_cell(raw_date)
-                if not date_raw:
+                iso_date = parse_date_to_iso(row.get("Дата"))
+                if not iso_date:
                     st.warning(
-                        f"❌ Строка {idx}: пустая дата при сумме {amount_f}, пропускаю."
+                        f"❌ Строка {idx}: не удалось разобрать дату при сумме {amount_f}, пропускаю."
                     )
                     errors += 1
                     continue
 
-                # нормализация даты
-                dt = pd.to_datetime(date_raw, dayfirst=True, errors="coerce")
-                if pd.isna(dt):
-                    st.warning(
-                        f"❌ Строка {idx}: не удалось разобрать дату {date_raw!r}, пропускаю."
-                    )
-                    errors += 1
-                    continue
-
-                date_str = dt.strftime("%Y-%m-%d")
-
-                cur.execute("SELECT id FROM shifts WHERE date = ?", (date_str,))
+                cur.execute("SELECT id FROM shifts WHERE date = ?", (iso_date,))
                 s = cur.fetchone()
                 if s:
                     shift_id = s[0]
@@ -225,7 +255,7 @@ def import_from_excel(uploaded_file) -> int:
                     cur.execute(
                         "INSERT INTO shifts (date, is_open, opened_at, closed_at) "
                         "VALUES (?, 0, ?, ?)",
-                        (date_str, date_str, date_str),
+                        (iso_date, iso_date, iso_date),
                     )
                     shift_id = cur.lastrowid
 
@@ -403,27 +433,15 @@ def import_from_gsheet(sheet_url: str) -> int:
                 errors += 1
                 continue
 
-            raw_date = row.get("Дата")
-            date_raw = safe_str_cell(raw_date)
-            if not date_raw:
+            iso_date = parse_date_to_iso(row.get("Дата"))
+            if not iso_date:
                 st.warning(
-                    f"❌ Строка {idx}: пустая дата при сумме {amount_f}, пропускаю."
+                    f"❌ Строка {idx}: не удалось разобрать дату при сумме {amount_f}, пропускаю."
                 )
                 errors += 1
                 continue
 
-            # нормализация даты из Google Sheets
-            dt = pd.to_datetime(date_raw, dayfirst=True, errors="coerce")
-            if pd.isna(dt):
-                st.warning(
-                    f"❌ Строка {idx}: не удалось разобрать дату {date_raw!r}, пропускаю."
-                )
-                errors += 1
-                continue
-
-            date_str = dt.strftime("%Y-%m-%d")
-
-            cur.execute("SELECT id FROM shifts WHERE date = ?", (date_str,))
+            cur.execute("SELECT id FROM shifts WHERE date = ?", (iso_date,))
             s = cur.fetchone()
             if s:
                 shift_id = s[0]
@@ -431,7 +449,7 @@ def import_from_gsheet(sheet_url: str) -> int:
                 cur.execute(
                     "INSERT INTO shifts (date, is_open, opened_at, closed_at) "
                     "VALUES (?, 0, ?, ?)",
-                    (date_str, date_str, date_str),
+                    (iso_date, iso_date, iso_date),
                 )
                 shift_id = cur.lastrowid
 
@@ -505,6 +523,7 @@ def normalize_shift_dates():
     Понимает старые форматы:
       - '02.02.2026', '02-02-2026', '02/02/2026'
       - '2026/02/07', '2026.02.07'
+      - '2026-02-07'
     """
     conn = get_connection()
     cur = conn.cursor()
@@ -514,43 +533,9 @@ def normalize_shift_dates():
     fixed = 0
     skipped = 0
 
-    from datetime import datetime as _dt
-
     for shift_id, date_str in rows:
-        if not date_str:
-            skipped += 1
-            continue
-
-        s = str(date_str).strip()
-        new_val = None
-
-        # 1) Уже ISO-формат YYYY-MM-DD
-        try:
-            dt = _dt.strptime(s, "%Y-%m-%d")
-            new_val = dt.strftime("%Y-%m-%d")
-        except ValueError:
-            pass
-
-        # 2) ДД.ММ.ГГГГ и варианты
-        if new_val is None:
-            for fmt in ("%d.%m.%Y", "%d-%m-%Y", "%d/%m/%Y"):
-                try:
-                    dt = _dt.strptime(s, fmt)
-                    new_val = dt.strftime("%Y-%m-%d")
-                    break
-                except ValueError:
-                    continue
-
-        # 3) ГГГГ/ММ/ДД и ГГГГ.ММ.ДД (как на скриншотах)
-        if new_val is None:
-            for fmt in ("%Y/%m/%d", "%Y.%m.%d"):
-                try:
-                    dt = _dt.strptime(s, fmt)
-                    new_val = dt.strftime("%Y-%m-%d")
-                    break
-                except ValueError:
-                    continue
-
+        new_val = parse_date_to_iso(date_str)
+        s = str(date_str).strip() if date_str is not None else ""
         if new_val and new_val != s:
             cur.execute("UPDATE shifts SET date = ? WHERE id = ?", (new_val, shift_id))
             fixed += 1
@@ -560,7 +545,6 @@ def normalize_shift_dates():
     conn.commit()
     conn.close()
     return fixed, skipped
-
 
 
 # ===== UI / ЗАПУСК СТРАНИЦЫ =====
@@ -639,7 +623,7 @@ with st.expander("✏️ Установить накопленный безна�
 with st.expander("🗓 Нормализовать даты смен (исправить формат дат)", expanded=False):
     st.caption(
         "Используйте, если в отчётах месяцы определяются неправильно "
-        "(например, февраль попадает в июнь). "
+        "(например, февраль попадает в июль). "
         "Все даты в shifts будут приведены к виду ГГГГ-ММ-ДД."
     )
     if st.button("Исправить формат дат в shifts"):

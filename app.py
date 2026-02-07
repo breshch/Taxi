@@ -162,6 +162,7 @@ def get_open_shift():
 
 
 def open_shift(date_str: str) -> int:
+    """date_str должен быть в формате YYYY-MM-DD."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     now = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -488,4 +489,4 @@ else:
             r1.metric("Доход", f"{income:.0f} ₽")
             r2.metric("Бензин", f"{fuel_cost:.0f} ₽")
             r3.metric("Чистая прибыль", f"{profit:.0f} ₽")
-            st.info("Проверьте отчёт в разделе Reports / Admin для детализации.")   
+            st.info("Проверьте отчёт в разделе Reports / Admin для детализации.")

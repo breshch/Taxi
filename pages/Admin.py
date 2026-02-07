@@ -502,7 +502,9 @@ def import_from_gsheet(sheet_url: str) -> int:
 def normalize_shift_dates():
     """
     Привести все даты в shifts к формату YYYY-MM-DD.
-    Понимает старые форматы типа '02.02.2025', '02-02-2025', '02/02/2025'.
+    Понимает старые форматы:
+      - '02.02.2026', '02-02-2026', '02/02/2026'
+      - '2026/02/07', '2026.02.07'
     """
     conn = get_connection()
     cur = conn.cursor()
@@ -529,9 +531,19 @@ def normalize_shift_dates():
         except ValueError:
             pass
 
-        # 2) Попробовать несколько вариантов ДД.ММ.ГГГГ
+        # 2) ДД.ММ.ГГГГ и варианты
         if new_val is None:
             for fmt in ("%d.%m.%Y", "%d-%m-%Y", "%d/%m/%Y"):
+                try:
+                    dt = _dt.strptime(s, fmt)
+                    new_val = dt.strftime("%Y-%m-%d")
+                    break
+                except ValueError:
+                    continue
+
+        # 3) ГГГГ/ММ/ДД и ГГГГ.ММ.ДД (как на скриншотах)
+        if new_val is None:
+            for fmt in ("%Y/%m/%d", "%Y.%m.%d"):
                 try:
                     dt = _dt.strptime(s, fmt)
                     new_val = dt.strftime("%Y-%m-%d")
@@ -548,6 +560,7 @@ def normalize_shift_dates():
     conn.commit()
     conn.close()
     return fixed, skipped
+
 
 
 # ===== UI / ЗАПУСК СТРАНИЦЫ =====

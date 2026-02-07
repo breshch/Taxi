@@ -313,11 +313,9 @@ if not open_shift_data:
             submitted_tpl = st.form_submit_button("📂 Открыть смену")
 
         if submitted_tpl:
-            # в БД сохраняем в формате YYYY-MM-DD
-            date_str_db = date_input.strftime("%Y-%m-%d")
+            date_str_db = date_input.strftime("%Y-%m-%d")   # в БД ISO
             open_shift(date_str_db)
-            # пользователю показываем ДД/ММ/ГГГГ
-            date_str_show = date_input.strftime("%d/%m/%Y")
+            date_str_show = date_input.strftime("%d/%m/%Y") # в сообщении ДД/ММ/ГГГГ
             st.success(f"Смена открыта: {date_str_show}")
             st.rerun()
 

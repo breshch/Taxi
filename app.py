@@ -316,17 +316,17 @@ if not open_shift_data:
             # в БД сохраняем в формате YYYY-MM-DD
             date_str_db = date_input.strftime("%Y-%m-%d")
             open_shift(date_str_db)
-            # пользователю показываем ДД.ММ.ГГГГ
-            date_str_ru = date_input.strftime("%d.%m.%Y")
-            st.success(f"Смена открыта: {date_str_ru}")
+            # пользователю показываем ДД/ММ/ГГГГ
+            date_str_show = date_input.strftime("%d/%m/%Y")
+            st.success(f"Смена открыта: {date_str_show}")
             st.rerun()
 
     st.caption("История и отчёты — на страницах Reports / Admin в левом меню.")
 else:
     shift_id, date_str = open_shift_data
-    # date_str хранится как YYYY-MM-DD, показываем как ДД.ММ.ГГГГ
+    # date_str хранится как YYYY-MM-DD, показываем как ДД/ММ/ГГГГ
     try:
-        date_show = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
+        date_show = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d/%m/%Y")
     except Exception:
         date_show = date_str
     st.success(f"📅 Открыта смена: {date_show}")

@@ -89,7 +89,7 @@ def get_accumulated_beznal():
 
 
 def recalc_full_db():
-    """Пересчитать комиссии, total и безнал по всем заказам и обновить accumulated_beznal."""
+    """Пересчитать комиссию, total и безнал по всем заказам и обновить accumulated_beznal."""
     conn = get_connection()
     cur = conn.cursor()
 
@@ -499,6 +499,57 @@ def import_from_gsheet(sheet_url: str) -> int:
     return imported
 
 
+def normalize_shift_dates():
+    """
+    Привести все даты в shifts к формату YYYY-MM-DD.
+    Понимает старые форматы типа '02.02.2025', '02-02-2025', '02/02/2025'.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, date FROM shifts")
+    rows = cur.fetchall()
+
+    fixed = 0
+    skipped = 0
+
+    from datetime import datetime as _dt
+
+    for shift_id, date_str in rows:
+        if not date_str:
+            skipped += 1
+            continue
+
+        s = str(date_str).strip()
+        new_val = None
+
+        # 1) Уже ISO-формат YYYY-MM-DD
+        try:
+            dt = _dt.strptime(s, "%Y-%m-%d")
+            new_val = dt.strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+        # 2) Попробовать несколько вариантов ДД.ММ.ГГГГ
+        if new_val is None:
+            for fmt in ("%d.%m.%Y", "%d-%m-%Y", "%d/%m/%Y"):
+                try:
+                    dt = _dt.strptime(s, fmt)
+                    new_val = dt.strftime("%Y-%m-%d")
+                    break
+                except ValueError:
+                    continue
+
+        if new_val and new_val != s:
+            cur.execute("UPDATE shifts SET date = ? WHERE id = ?", (new_val, shift_id))
+            fixed += 1
+        else:
+            skipped += 1
+
+    conn.commit()
+    conn.close()
+    return fixed, skipped
+
+
 # ===== UI / ЗАПУСК СТРАНИЦЫ =====
 st.set_page_config(page_title="Администрирование", page_icon="🛠", layout="centered")
 st.title("🛠 Администрирование")
@@ -570,6 +621,18 @@ with st.expander("✏️ Установить накопленный безна�
         conn.commit()
         conn.close()
         st.success(f"В базе теперь записано: {new_value:.0f} ₽")
+
+# 2.2 Нормализовать даты смен
+with st.expander("🗓 Нормализовать даты смен (исправить формат дат)", expanded=False):
+    st.caption(
+        "Используйте, если в отчётах месяцы определяются неправильно "
+        "(например, февраль попадает в июнь). "
+        "Все даты в shifts будут приведены к виду ГГГГ-ММ-ДД."
+    )
+    if st.button("Исправить формат дат в shifts"):
+        fixed, skipped = normalize_shift_dates()
+        st.success(f"Исправлено дат: {fixed}. Пропущено без изменений: {skipped}.")
+        st.info("Теперь зайдите на страницу Reports и выберите ещё раз месяц.")
 
 # 3. Сброс базы
 with st.expander("⚠️ Полный сброс базы", expanded=False):

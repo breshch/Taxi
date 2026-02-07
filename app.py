@@ -8,9 +8,6 @@ DB_NAME = "taxi.db"
 rate_nal = 0.78   # процент для нала (для расчёта комиссии)
 rate_card = 0.75  # процент для карты
 
-FUEL_PRICE = 55.0        # цена бензина за литр
-FUEL_CONSUMPTION = 8.0   # расход л/100 км
-
 # Московский часовой пояс
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
@@ -292,6 +289,39 @@ def add_to_accumulated_beznal(amount: float):
     conn.close()
 
 
+def get_last_fuel_params():
+    """
+    Возвращает (расход_л_на_100км, цена_бензина_за_литр) из последней закрытой смены,
+    либо (8.0, 55.0) по умолчанию, если данных ещё нет.
+    """
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT fuel_liters, km, fuel_price
+        FROM shifts
+        WHERE is_open = 0
+          AND km > 0
+          AND fuel_liters > 0
+          AND fuel_price > 0
+        ORDER BY closed_at DESC, id DESC
+        LIMIT 1
+        """
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return 8.0, 55.0
+
+    fuel_liters, km, fuel_price = row
+    try:
+        consumption = (fuel_liters / km) * 100 if km > 0 else 8.0
+    except Exception:
+        consumption = 8.0
+
+    return float(consumption or 8.0), float(fuel_price or 55.0)
+
 # ===== UI =====
 st.set_page_config(page_title="Такси учёт", page_icon="🚕", layout="centered")
 apply_custom_css()
@@ -460,26 +490,53 @@ else:
     # ===== Закрытие смены =====
     st.write("---")
     with st.expander("🔒 Закрыть смену (километраж)"):
+        # последние параметры топлива
+        last_consumption, last_price = get_last_fuel_params()
+
         with st.form("close_form"):
             km = st.number_input(
                 "Километраж за смену (км)", min_value=0, step=10
             )
 
-            if km > 0:
-                liters = (km / 100) * FUEL_CONSUMPTION
-                fuel_cost = liters * FUEL_PRICE
+            col1, col2 = st.columns(2)
+            with col1:
+                consumption = st.number_input(
+                    "Расход, л на 100 км",
+                    min_value=0.0,
+                    step=0.5,
+                    value=float(f"{last_consumption:.1f}"),
+                    format="%.1f",
+                )
+            with col2:
+                fuel_price = st.number_input(
+                    "Цена бензина, ₽/л",
+                    min_value=0.0,
+                    step=1.0,
+                    value=float(f"{last_price:.1f}"),
+                    format="%.1f",
+                )
+
+            if km > 0 and consumption > 0 and fuel_price > 0:
+                liters = (km / 100) * consumption
+                fuel_cost = liters * fuel_price
                 st.write(
                     f"Расход: {liters:.1f} л, бензин: {fuel_cost:.2f} ₽"
                 )
             else:
+                liters = 0.0
                 fuel_cost = 0.0
 
             submitted_close = st.form_submit_button("🔒 Закрыть смену")
 
         if submitted_close:
-            liters = (km / 100) * FUEL_CONSUMPTION
-            fuel_cost = liters * FUEL_PRICE
-            close_shift_db(shift_id, km, liters, FUEL_PRICE)
+            if km > 0 and consumption > 0 and fuel_price > 0:
+                liters = (km / 100) * consumption
+                fuel_cost = liters * fuel_price
+            else:
+                liters = 0.0
+                fuel_cost = 0.0
+
+            close_shift_db(shift_id, km, liters, fuel_price)
 
             income = nal + card + tips_sum
             profit = income - fuel_cost

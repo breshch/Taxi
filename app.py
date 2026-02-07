@@ -310,12 +310,15 @@ if not open_shift_data:
                 "Дата смены",
                 value=date.today(),
             )
+            st.caption(f"Выбрано: {date_input.strftime('%d/%m/%Y')}")
             submitted_tpl = st.form_submit_button("📂 Открыть смену")
 
         if submitted_tpl:
-            date_str_db = date_input.strftime("%Y-%m-%d")   # в БД ISO
+            # в БД сохраняем в формате YYYY-MM-DD
+            date_str_db = date_input.strftime("%Y-%m-%d")
             open_shift(date_str_db)
-            date_str_show = date_input.strftime("%d/%m/%Y") # в сообщении ДД/ММ/ГГГГ
+            # пользователю показываем ДД/ММ/ГГГГ
+            date_str_show = date_input.strftime("%d/%m/%Y")
             st.success(f"Смена открыта: {date_str_show}")
             st.rerun()
 
@@ -333,19 +336,23 @@ else:
     if acc != 0:
         st.metric("Накопленный безнал", f"{acc:.0f} ₽")
 
-    # ===== Форма добавления заказа =====
+    # ===== Форма добавления заказа (без 0 по умолчанию) =====
     with st.expander("➕ Добавить заказ", expanded=True):
         with st.form("order_form"):
             c1, c2 = st.columns(2)
             with c1:
-                amount = st.number_input(
-                    "Сумма заказа, ₽", min_value=0.0, step=50.0, format="%.2f"
+                amount_str = st.text_input(
+                    "Сумма заказа, ₽",
+                    value="",
+                    placeholder="например, 650",
                 )
             with c2:
                 payment = st.selectbox("Тип оплаты", ["нал", "карта"])
 
-            tips = st.number_input(
-                "Чаевые, ₽ (без комиссии)", min_value=0.0, step=10.0, value=0.0
+            tips_str = st.text_input(
+                "Чаевые, ₽ (без комиссии)",
+                value="",
+                placeholder="0 (если без чаевых)",
             )
 
             now_moscow = datetime.now(MOSCOW_TZ)
@@ -353,7 +360,27 @@ else:
 
             submitted = st.form_submit_button("💾 Сохранить заказ")
 
-        if submitted and amount > 0:
+        if submitted:
+            # парсим сумму
+            try:
+                amount = float(amount_str.replace(",", "."))
+            except ValueError:
+                st.error("Введите сумму заказа числом.")
+                st.stop()
+
+            if amount <= 0:
+                st.error("Сумма заказа должна быть больше нуля.")
+                st.stop()
+
+            # парсим чаевые (пусто -> 0)
+            tips = 0.0
+            if tips_str.strip():
+                try:
+                    tips = float(tips_str.replace(",", "."))
+                except ValueError:
+                    st.error("Чаевые нужно вводить числом (или оставить пустым).")
+                    st.stop()
+
             order_time = datetime.now(MOSCOW_TZ).strftime("%H:%M")
 
             if payment == "нал":
@@ -461,3 +488,4 @@ else:
             r1.metric("Доход", f"{income:.0f} ₽")
             r2.metric("Бензин", f"{fuel_cost:.0f} ₽")
             r3.metric("Чистая прибыль", f"{profit:.0f} ₽")
+            st.info("Проверьте отчёт в разделе Reports / Admin для детализации.")   

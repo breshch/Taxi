@@ -415,6 +415,92 @@ else:
         width="stretch",
     )
 
+# 1. ОТЧЁТ ПО ОДНОЙ СМЕНЕ
+st.write("---")
+st.subheader("📄 Отчёт по смене")
+
+if df_shifts.empty:
+    st.write("Нет закрытых смен с заказами за выбранный месяц.")
+else:
+    available_dates = df_shifts["Дата"].unique().tolist()
+    selected_date = st.selectbox(
+        "Дата смены",
+        options=available_dates,
+    )
+
+    df_shift_summary = df_shifts[df_shifts["Дата"] == selected_date].copy()
+    if not df_shift_summary.empty:
+        df_shift_summary.index = list(range(1, len(df_shift_summary) + 1))
+        st.dataframe(
+            df_shift_summary.style.format(
+                {
+                    "Нал": "{:.0f}",
+                    "Карта": "{:.0f}",
+                    "Чаевые": "{:.0f}",
+                    "Δ безнал": "{:.0f}",
+                    "Км": "{:.0f}",
+                    "Литры": "{:.1f}",
+                    "Цена": "{:.1f}",
+                    "Всего": "{:.0f}",
+                }
+            ),
+            width="stretch",
+        )
+
+        # --- НОВЫЙ БЛОК: мини-отчёт по смене ---
+        row = df_shift_summary.iloc[0]
+        nal_shift = float(row["Нал"] or 0.0)
+        card_shift = float(row["Карта"] or 0.0)
+        tips_shift = float(row["Чаевые"] or 0.0)
+        delta_beznal_shift = float(row["Δ безнал"] or 0.0)
+        liters_shift = float(row["Литры"] or 0.0)
+        price_shift = float(row["Цена"] or 0.0)
+        total_shift = float(row["Всего"] or 0.0)
+
+        fuel_cost_shift = liters_shift * price_shift
+        profit_shift = total_shift - fuel_cost_shift
+
+        st.markdown("**Краткий отчёт по выбранной смене**")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Нал", f"{nal_shift:.0f} ₽")
+        c2.metric("Карта", f"{card_shift:.0f} ₽")
+        c3.metric("Чаевые", f"{tips_shift:.0f} ₽")
+
+        c4, c5, c6 = st.columns(3)
+        c4.metric("Δ безнала", f"{delta_beznal_shift:.0f} ₽")
+        c5.metric("Бензин", f"{fuel_cost_shift:.0f} ₽")
+        c6.metric("Прибыль (≈)", f"{profit_shift:.0f} ₽")
+        # --- КОНЕЦ НОВОГО БЛОКА ---
+
+    shift_id = get_closed_shift_id_by_date(selected_date)
+
+    st.markdown("**Заказы в смене**")
+    df_orders = get_shift_orders_df(shift_id)
+    if df_orders.empty:
+        st.write("Нет заказов для выбранной смены.")
+    else:
+        st.dataframe(
+            df_orders.style.format(
+                {
+                    "Сумма": "{:.0f}",
+                    "Чаевые": "{:.0f}",
+                    "Δ безнал": "{:.0f}",
+                    "Вам": "{:.0f}",
+                }
+            ),
+            width="stretch",
+        )
+
+    st.markdown("**График заказов по часам**")
+    df_hours = get_orders_by_hour(selected_date)
+    df_hours["Час"] = df_hours["Час"].apply(lambda h: f"{h:02d}:00")
+    st.bar_chart(
+        data=df_hours,
+        x="Час",
+        y="Заказов",
+    )
+
+
 # 3. ОТЧЁТ ЗА МЕСЯЦ (ИТОГИ)
 st.write("---")
 st.subheader("📊 Отчёт за месяц")

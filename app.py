@@ -427,15 +427,23 @@ else:
                 total = final_wo_tips + tips
                 beznal_added = final_wo_tips
 
-            add_order_db(
-                shift_id, typ, amount, tips, commission, total, beznal_added, order_time
-            )
+            # попытка записи заказа
+            try:
+                add_order_db(
+                    shift_id, typ, amount, tips, commission, total, beznal_added, order_time
+                )
 
-            if beznal_added != 0:
-                add_to_accumulated_beznal(beznal_added)
+                if beznal_added != 0:
+                    add_to_accumulated_beznal(beznal_added)
 
-            st.success(f"✓ Сохранено. Вам сразу: {total:.2f} ₽")
-            st.rerun()
+                human_type = "Нал" if typ == "нал" else "Карта"
+                st.success(
+                    f"Запись удачна: {human_type}, сумма {amount:.2f} ₽, "
+                    f"чаевые {tips:.2f} ₽, вам {total:.2f} ₽"
+                )
+                st.rerun()
+            except Exception as e:
+                st.error(f"Ошибка при сохранении заказа: {e}")
 
     # ===== Список заказов и итоги =====
     orders = get_shift_orders(shift_id)

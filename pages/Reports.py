@@ -3,11 +3,17 @@ import sqlite3
 import pandas as pd
 from datetime import datetime
 
-DB_NAME = "taxi.db"
+# ===== Определяем имя базы текущего пользователя =====
+def get_db_name() -> str:
+    db = st.session_state.get("db_name")
+    if not db:
+        # запасной вариант, если Reports открыт напрямую
+        db = "taxi_default.db"
+    return db
 
 # ===== Работа с БД =====
 def get_connection():
-    return sqlite3.connect(DB_NAME)
+    return sqlite3.connect(get_db_name())
 
 
 def get_available_year_months():
@@ -59,7 +65,6 @@ def get_month_totals(year_month: str):
     """
     conn = get_connection()
     cur = conn.cursor()
-
     cur.execute(
         """
         SELECT id
@@ -101,7 +106,6 @@ def get_month_totals(year_month: str):
 
     conn.close()
     current_acc = get_current_accumulated_beznal()
-
     return {
         "нал": total_nal,
         "карта": total_card,
@@ -120,7 +124,6 @@ def get_month_shifts_details(year_month: str) -> pd.DataFrame:
     """
     conn = get_connection()
     cur = conn.cursor()
-
     cur.execute(
         """
         SELECT id, date, km, fuel_liters, fuel_price
@@ -270,7 +273,6 @@ def get_orders_by_hour(date_str: str) -> pd.DataFrame:
     full = pd.DataFrame({"Час": list(range(24))})
     df = full.merge(df, on="Час", how="left").fillna(0)
     df["Заказов"] = df["Заказов"].astype(int)
-
     return df
 
 
@@ -313,9 +315,10 @@ def format_date_ddmmyyyy(s: str) -> str:
 
 
 # ===== UI =====
-
 st.set_page_config(page_title="Отчёты", page_icon="📊", layout="centered")
-st.title("📊 Отчёты")
+
+current_user = st.session_state.get("username", "—")
+st.title(f"📊 Отчёты — {current_user}")
 
 year_months = get_available_year_months()
 
@@ -457,7 +460,6 @@ col6.metric("Смен", f"{totals['смен']}")
 
 total_income = totals["всего"]
 
-# Расходы на бензин и примерная прибыль за месяц
 if df_shifts.empty:
     fuel_cost = 0.0
 else:

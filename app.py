@@ -1,9 +1,11 @@
 import streamlit as st
 import sqlite3
 from datetime import datetime, date, timezone, timedelta
+import hashlib
+import os
 
 # ===== НАСТРОЙКИ =====
-DB_NAME = "taxi.db"
+AUTH_DB = "users.db"  # база с пользователями (логин/пароль)
 
 rate_nal = 0.78   # процент для нала (для расчёта комиссии)
 rate_card = 0.75  # процент для карты
@@ -82,9 +84,92 @@ def apply_custom_css():
         unsafe_allow_html=True,
     )
 
-# ===== ФУНКЦИИ БД =====
+# ===== АВТОРИЗАЦИЯ (users.db) =====
+def get_auth_conn():
+    return sqlite3.connect(AUTH_DB)
+
+
+def init_auth_db():
+    conn = get_auth_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            created_at TEXT
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def register_user(username: str, password: str) -> bool:
+    username = username.strip()
+    if not username or not password:
+        return False
+    conn = get_auth_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO users (username, password_hash, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (
+                username,
+                hash_password(password),
+                datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+        )
+        conn.commit()
+        ok = True
+    except sqlite3.IntegrityError:
+        ok = False
+    finally:
+        conn.close()
+    return ok
+
+
+def authenticate_user(username: str, password: str) -> bool:
+    username = username.strip()
+    conn = get_auth_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return False
+    return row[0] == hash_password(password)
+
+
+def get_current_db_name() -> str:
+    """
+    Имя базы для текущего пользователя.
+    Если ещё не логин, вернётся 'taxi_default.db'.
+    """
+    username = st.session_state.get("username")
+    if not username:
+        return "taxi_default.db"
+    safe_name = "".join(c for c in username if c.isalnum() or c in ("_", "-"))
+    if not safe_name:
+        safe_name = "user"
+    return f"taxi_{safe_name}.db"
+
+
+# ===== ФУНКЦИИ БД ДЛЯ СМЕН И ЗАКАЗОВ (пер-пользовательские БД) =====
+def get_db_connection():
+    return sqlite3.connect(get_current_db_name())
+
+
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     cursor.execute(
@@ -150,7 +235,7 @@ def init_db():
 
 def get_open_shift():
     """Возвращает (id, date) открытой смены или None."""
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, date FROM shifts WHERE is_open = 1 LIMIT 1")
     row = cursor.fetchone()
@@ -160,7 +245,7 @@ def get_open_shift():
 
 def open_shift(date_str: str) -> int:
     """date_str должен быть в формате YYYY-MM-DD."""
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     now = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M:%S")
     cursor.execute(
@@ -174,7 +259,7 @@ def open_shift(date_str: str) -> int:
 
 
 def close_shift_db(shift_id: int, km: int, liters: float, fuel_price: float):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     now = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M:%S")
     cursor.execute(
@@ -199,7 +284,7 @@ def add_order_db(
     beznal_added,
     order_time,
 ):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -222,7 +307,7 @@ def add_order_db(
 
 
 def get_shift_orders(shift_id):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -239,7 +324,7 @@ def get_shift_orders(shift_id):
 
 
 def get_shift_totals(shift_id):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     cursor.execute(
@@ -265,7 +350,7 @@ def get_shift_totals(shift_id):
 
 
 def get_accumulated_beznal():
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT total_amount FROM accumulated_beznal WHERE driver_id = 1")
     row = cursor.fetchone()
@@ -274,7 +359,7 @@ def get_accumulated_beznal():
 
 
 def add_to_accumulated_beznal(amount: float):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     now = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M:%S")
     cursor.execute(
@@ -294,7 +379,7 @@ def get_last_fuel_params():
     Возвращает (расход_л_на_100км, цена_бензина_за_литр) из последней закрытой смены,
     либо (8.0, 55.0) по умолчанию, если данных ещё нет.
     """
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
         """
@@ -322,19 +407,78 @@ def get_last_fuel_params():
 
     return float(consumption or 8.0), float(fuel_price or 55.0)
 
-# ===== UI =====
+
+# ===== UI / ЗАПУСК =====
 st.set_page_config(page_title="Такси учёт", page_icon="🚕", layout="centered")
 apply_custom_css()
+init_auth_db()
+
+# ----- Блок логина / регистрации -----
+if "username" not in st.session_state:
+    st.title("🚕 Учёт работы такси — вход")
+
+    tab_login, tab_reg = st.tabs(["Вход", "Регистрация"])
+
+    # ВХОД
+    with tab_login:
+        with st.form("login_form"):
+            login_username = st.text_input("Имя пользователя")
+            login_password = st.text_input("Пароль", type="password")
+            login_btn = st.form_submit_button("Войти")
+
+        if login_btn:
+            if not login_username or not login_password:
+                st.error("Введите имя пользователя и пароль.")
+            elif authenticate_user(login_username, login_password):
+                st.session_state["username"] = login_username.strip()
+                st.session_state["db_name"] = get_current_db_name()
+                st.success(f"Добро пожаловать, {st.session_state['username']}!")
+                st.rerun()
+            else:
+                st.error("Неверное имя пользователя или пароль.")
+
+    # РЕГИСТРАЦИЯ
+    with tab_reg:
+        st.caption("Регистрация нового пользователя. Используйте сложный пароль.")
+        with st.form("register_form"):
+            reg_username = st.text_input("Имя пользователя (логин)")
+            reg_password = st.text_input("Пароль", type="password")
+            reg_password2 = st.text_input("Повтор пароля", type="password")
+            reg_btn = st.form_submit_button("Зарегистрироваться")
+
+        if reg_btn:
+            if not reg_username or not reg_password:
+                st.error("Имя пользователя и пароль не могут быть пустыми.")
+            elif reg_password != reg_password2:
+                st.error("Пароли не совпадают.")
+            else:
+                ok = register_user(reg_username, reg_password)
+                if ok:
+                    st.success("Пользователь создан. Теперь можно войти во вкладке 'Вход'.")
+                else:
+                    st.error("Такой пользователь уже существует.")
+
+    st.stop()
+
+# Если мы здесь — пользователь залогинен
+st.session_state["db_name"] = get_current_db_name()
 init_db()
 
-st.title("🚕 Учёт работы такси")
+st.title(f"🚕 Учёт работы такси — {st.session_state['username']}")
+
+# Кнопка выхода
+with st.sidebar:
+    st.markdown(f"**Пользователь:** {st.session_state['username']}")
+    if st.button("Выйти"):
+        st.session_state.clear()
+        st.rerun()
 
 open_shift_data = get_open_shift()
 
 if not open_shift_data:
     st.info("Сейчас нет открытой смены.")
 
-    # Простое открытие смены без шаблона пробега/часов
+    # Открытие смены
     with st.expander("📝 Открыть смену", expanded=True):
         with st.form("open_shift_form"):
             date_input = st.date_input(
@@ -345,18 +489,16 @@ if not open_shift_data:
             submitted_tpl = st.form_submit_button("📂 Открыть смену")
 
         if submitted_tpl:
-            # в БД сохраняем в формате YYYY-MM-DD
             date_str_db = date_input.strftime("%Y-%m-%d")
             open_shift(date_str_db)
-            # пользователю показываем ДД/ММ/ГГГГ
             date_str_show = date_input.strftime("%d/%m/%Y")
             st.success(f"Смена открыта: {date_str_show}")
             st.rerun()
 
     st.caption("История и отчёты — на страницах Reports / Admin в левом меню.")
+
 else:
     shift_id, date_str = open_shift_data
-    # date_str хранится как YYYY-MM-DD, показываем как ДД/ММ/ГГГГ
     try:
         date_show = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d/%m/%Y")
     except Exception:
@@ -367,7 +509,7 @@ else:
     if acc != 0:
         st.metric("Накопленный безнал", f"{acc:.0f} ₽")
 
-    # ===== Форма добавления заказа (без 0 по умолчанию) =====
+    # ===== Форма добавления заказа =====
     with st.expander("➕ Добавить заказ", expanded=True):
         with st.form("order_form"):
             c1, c2 = st.columns(2)
@@ -392,7 +534,6 @@ else:
             submitted = st.form_submit_button("💾 Сохранить заказ")
 
         if submitted:
-            # парсим сумму
             try:
                 amount = float(amount_str.replace(",", "."))
             except ValueError:
@@ -403,7 +544,6 @@ else:
                 st.error("Сумма заказа должна быть больше нуля.")
                 st.stop()
 
-            # парсим чаевые (пусто -> 0)
             tips = 0.0
             if tips_str.strip():
                 try:
@@ -427,7 +567,6 @@ else:
                 total = final_wo_tips + tips
                 beznal_added = final_wo_tips
 
-            # попытка записи заказа
             try:
                 add_order_db(
                     shift_id, typ, amount, tips, commission, total, beznal_added, order_time
@@ -498,7 +637,6 @@ else:
     # ===== Закрытие смены =====
     st.write("---")
     with st.expander("🔒 Закрыть смену (километраж)"):
-        # последние параметры топлива
         last_consumption, last_price = get_last_fuel_params()
 
         with st.form("close_form"):
